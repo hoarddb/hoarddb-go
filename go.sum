@@ -1,0 +1,4 @@
+github.com/hoarddb/hoarddb-bson v0.8.1 h1:YYBSGY54jA2BEsOBYoULnDnhj3qWLFjwcgYdZiX4w8Q=
+github.com/hoarddb/hoarddb-bson v0.8.1/go.mod h1:hwT00UfoIaWGRGsJA5yli0BslrBHu/3Y47qQdKREw4A=
+github.com/hoarddb/hoarddb-wire v0.1.0 h1:roor/GzfNXs9eUWpcdssv6IJfDaDl86L4uIzUuyOWng=
+github.com/hoarddb/hoarddb-wire v0.1.0/go.mod h1:HEG5bIbSahhmYqBdJlnPoGf3R8TeT5HrtFuS7MmGtxI=

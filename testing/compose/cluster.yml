@@ -1,0 +1,180 @@
+# hoardDB 3-node cluster (replication factor 3), built from the fetched server binary.
+#
+#   cp "$HOARDDB_SERVER_BIN" hoardDB-server   # the linux binary named in ../server.json, beside server.Dockerfile
+#   docker compose -f cluster.yml up -d --build
+#   export HOARDDB_ROOT_PASSWORD="$(docker compose exec -T node1 cat /pki/root.password)"
+#
+# Ports:
+#   client/driver  7433  the server's default driver port (HOARDDB_TCP_LISTEN)
+#                        published as 7433 / 7434 / 7435 for node1 / node2 / node3,
+#                        on 127.0.0.1 only: this machine can reach them, the
+#                        network cannot. To serve other machines, change
+#                        "127.0.0.1:7433:7433" to "7433:7433" (every interface)
+#                        and firewall it.
+#   internode      4434  the ring address port + 1;
+#                        published as 4434 / 4436 / 4438, which is what a peer
+#                        outside this compose network would use for the ring
+#                        addresses ...:4433 / ...:4435 / ...:4437
+#   4433 itself is only the ring identity (HOARDDB_LISTEN); nothing binds it,
+#   so it is deliberately not published.
+#
+# Trust: hoardDB refuses to start a cluster whose peers it cannot pin.
+# The one-shot "pki" service below generates one ed25519
+# certificate per node, the fingerprint list, and a shared cluster token into
+# the "pki" volume; every node installs its own key on first start and pins
+# the others. It needs network access once, to install openssl.
+#
+# Root password: chosen at the first start. The "pki" service writes the one you
+# set (HOARDDB_ROOT_PASSWORD=... docker compose up -d), else generates one, into
+# the pki volume (/pki/root.password, 0600; read it with the command at the top).
+# It is written once: the root user is seeded once, so a password set on a later
+# run is ignored. To change it afterwards, rotate it with -reset-password.
+
+x-hoarddb-node: &hoarddb-node
+  image: hoarddb:local
+  build:
+    context: .
+    dockerfile: server.Dockerfile
+  depends_on:
+    pki:
+      condition: service_completed_successfully
+  # Installs this node's pre-generated identity, pins its peers, then starts
+  # the server. $$ is Compose's escape for a literal $.
+  entrypoint: ["/bin/sh", "-c"]
+  command:
+    - |
+      set -eu
+      mkdir -p /data/keys
+      if [ ! -f /data/keys/server.key ]; then
+        cp "/pki/$$HOARDDB_NODE_ID/server.key" "/pki/$$HOARDDB_NODE_ID/server.crt" /data/keys/
+        chmod 600 /data/keys/server.key
+      fi
+      export HOARDDB_SEED_FINGERPRINTS="$$(cat /pki/fingerprints)"
+      export HOARDDB_CLUSTER_TOKEN_FILE=/pki/cluster.token
+      exec hoarddb-server
+  restart: unless-stopped
+
+x-hoarddb-env: &hoarddb-env
+  HOARDDB_DATA_DIR: "/data"
+  HOARDDB_SEED_NODES: "node1@node1:4433,node2@node2:4433,node3@node3:4433"
+  HOARDDB_REPLICATION_FACTOR: "3"
+  HOARDDB_ROOT_USER: "admin"
+  HOARDDB_ROOT_PASSWORD_FILE: "/pki/root.password"
+  HOARDDB_LOG_LEVEL: "info"
+
+services:
+  pki:
+    image: alpine:3.20
+    container_name: hoarddb-pki
+    volumes:
+      - pki:/pki
+    environment:
+      HOARDDB_ROOT_PASSWORD: "${HOARDDB_ROOT_PASSWORD:-}"
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        # The root password every node reads (HOARDDB_ROOT_PASSWORD_FILE). The
+        # root user is seeded once, from the first password a node sees, so this
+        # file is written once too: the one you set on the first run, else a
+        # generated one. A password set on a later run would not authenticate, so
+        # it is ignored with a note rather than written over the working one.
+        if [ ! -f /pki/root.password ]; then
+          if [ -n "$${HOARDDB_ROOT_PASSWORD:-}" ]; then
+            printf '%s' "$$HOARDDB_ROOT_PASSWORD" > /pki/root.password
+          else
+            head -c 18 /dev/urandom | od -An -tx1 | tr -d ' \n' > /pki/root.password
+          fi
+        elif [ -n "$${HOARDDB_ROOT_PASSWORD:-}" ]; then
+          echo "pki: HOARDDB_ROOT_PASSWORD ignored: the root password was fixed on the first run; to change it, stop the cluster and run hoardDB-server -reset-password admin" >&2
+        fi
+        chmod 600 /pki/root.password
+        chown 1000:1000 /pki/root.password
+        [ -f /pki/fingerprints ] && exit 0
+        apk add --no-cache openssl >/dev/null
+        : > /pki/fingerprints.tmp
+        for node in node1 node2 node3; do
+          mkdir -p "/pki/$$node"
+          openssl req -x509 -newkey ed25519 -nodes -days 365 \
+            -subj "/O=hoardDB/CN=hoarddb-node" \
+            -keyout "/pki/$$node/server.key" -out "/pki/$$node/server.crt" 2>/dev/null
+          # hoardDB's fingerprint is the SHA-256 of the raw 32-byte ed25519 public key.
+          fingerprint="$$(openssl pkey -in "/pki/$$node/server.key" -pubout -outform DER | tail -c 32 | sha256sum | cut -d' ' -f1)"
+          printf '%s:4433=SHA256:%s,' "$$node" "$$fingerprint" >> /pki/fingerprints.tmp
+        done
+        sed -i 's/,$$//' /pki/fingerprints.tmp
+        head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > /pki/cluster.token
+        # The server image runs as uid 1000.
+        chown -R 1000:1000 /pki
+        # Written last: its presence means the material above is complete.
+        mv /pki/fingerprints.tmp /pki/fingerprints
+    networks:
+      - hoardnet
+
+  node1:
+    <<: *hoarddb-node
+    container_name: hoarddb-node1
+    hostname: node1
+    ports:
+      - "127.0.0.1:7433:7433"
+      - "4434:4434"
+    environment:
+      <<: *hoarddb-env
+      HOARDDB_NODE_ID: "node1"
+      HOARDDB_LISTEN: "node1:4433"
+    volumes:
+      - node1-data:/data
+      - pki:/pki:ro
+    networks:
+      hoardnet:
+        ipv4_address: 198.51.100.2
+
+  node2:
+    <<: *hoarddb-node
+    container_name: hoarddb-node2
+    hostname: node2
+    ports:
+      - "127.0.0.1:7434:7433"
+      - "4436:4434"
+    environment:
+      <<: *hoarddb-env
+      HOARDDB_NODE_ID: "node2"
+      HOARDDB_LISTEN: "node2:4433"
+    volumes:
+      - node2-data:/data
+      - pki:/pki:ro
+    networks:
+      hoardnet:
+        ipv4_address: 198.51.100.3
+
+  node3:
+    <<: *hoarddb-node
+    container_name: hoarddb-node3
+    hostname: node3
+    ports:
+      - "127.0.0.1:7435:7433"
+      - "4438:4434"
+    environment:
+      <<: *hoarddb-env
+      HOARDDB_NODE_ID: "node3"
+      HOARDDB_LISTEN: "node3:4433"
+    volumes:
+      - node3-data:/data
+      - pki:/pki:ro
+    networks:
+      hoardnet:
+        ipv4_address: 198.51.100.4
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
+  pki:
+
+networks:
+  hoardnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 198.51.100.0/24

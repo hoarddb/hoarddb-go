@@ -1,0 +1,29 @@
+name: ci
+
+# Actions minutes are capped, so this runs only on a pull request, a version
+# tag, or when started by hand. Linux only, one Go version (the go line of
+# go.mod), no matrix.
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    tags: ['v*']
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # -short skips the tests that need a running hoardDB server.
+      - run: go vet ./... && go test -short ./...

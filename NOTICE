@@ -1,0 +1,18 @@
+hoardDB Go driver
+Copyright 2026 Boeger IT Sh.p.k
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+This product includes software developed by third parties. Each is used under
+its own licence, reproduced in that project's source distribution:
+
+  github.com/hoarddb/hoarddb-bson (packages under bson and x/bsonx)
+    Licence: Apache License 2.0
+    Used for: encoding and decoding the BSON payloads of the hoardDB wire
+    protocol, behind the driver's private internal/codec package. Its Raw and
+    RawValue types appear in the public API only as hoarddbwire.Document and
+    hoarddbwire.Value, which alias them.
+    Its NOTICE and THIRD-PARTY-NOTICES credit the third-party portions it
+    derives from, with their licences.
+
+The Go standard library is used under its BSD-3-Clause licence.
