@@ -63,7 +63,7 @@ Default path `~/.hoarddb/known_servers`. The CLI, every driver, and the server f
 (`<data dir>/cluster/known_servers`) read and write the file by the four rules below: the canonical host
 form, the line grammar, file safety and saving. They are one contract for every driver.
 `testdata/trust-vectors/v1.json` holds them as data, generated from the Go implementation
-(`hoardDB/transport`; `testing.md` section 1.4), and a driver passes every vector in it.
+the server uses (`testing.md` section 1.4), and a driver passes every vector in it.
 
 ### 4.1 The canonical host form
 
@@ -223,6 +223,10 @@ trust vectors (`testdata/trust-vectors/v1.json`) carry the four rules above.
   Node driver that can cost a day.
 
 ## 6. The connection URI
+
+The Go ring client (`api-go.md`) does not take a URI yet: `ring.Dial` takes an address, a user, a
+password and one of `Fingerprint`, `KnownServers` or `Insecure`. The URI below is parsed by the root
+package `hoarddb` of the Go module and by the Node.js and Python drivers.
 
 The first line of every example anyone writes, so it is frozen. Grammar (RFC 3986 productions for
 `pchar`, `reg-name`, `IPv4address`, `IPv6address`):

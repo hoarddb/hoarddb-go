@@ -43,7 +43,7 @@ Every message, in both directions, is one frame:
 - **What the server does with a bad frame.**
   - A length word over 32 MiB is **answered**: the server reads the opcode and request ID and writes an
     `OpError` `INVALID_ARGUMENT` **echoing that request ID**, with a message naming the opcode, the size,
-    the 32 MiB limit and the remedy (split the request, or store a large value as a blob). On an
+    the 32 MiB limit and the remedy (split the request into smaller ones). On an
     authenticated connection whose length word is at most 64 MiB the server then discards the body and
     keeps the connection; past that, or before AUTH, it answers and closes.
   - A version byte other than 1, or a length under 17, is **not answered**: the server closes the
@@ -51,30 +51,27 @@ Every message, in both directions, is one frame:
   - So a driver **refuses an oversize frame itself, before writing a byte of it**, with a local
     `INVALID_ARGUMENT` error that gives the arithmetic (`1 + 16 + payload` against 33,554,432). The
     server's answer exists for clients that do not.
-- **Payloads are BSON documents**, with one exception: `GET_FAST` (section 5). An empty payload is legal
+- **Payloads are BSON documents**, except that `RING_KEYED`, `RING_BATCH` and `RING_GET_MANY` start with a binary prologue (section 11.2). An empty payload is legal
   (`PING` carries none; `PONG` answers with an empty payload: the transport answers it before any handler runs).
 
 ## 3. BSON payload rules
 
 - **Field names are exact and come from the vectors and `operations.md`, never from a guess.** Many
-  wire names are single lowercase words with no underscore where a reader might expect one:
-  `writeconcern`, `addtoset`, `blobid`, `bucketcount`, `nodeid`, `joinedat`, `schemajson`. Others carry
-  an underscore: `replication_factor`, `protocol_version`, `server_version`, `token_expires_at`,
-  `token_deadline`, `password_min_length`, `index_used`, `has_more`, `max_result_bytes`, `retained_bytes`, `write_outcome`,
-  `copies_confirmed`, `element_key`, `entry_id`, `blob_id` (field stores; the blob verbs say `blobid`).
-  Each is what it is; a driver pins every name in its own request and response types.
-- **Decode any numeric width.** The server sends `int32` or `int64` for integer fields depending on the
-  field (`total` is `int32` on a search answer, where it is the number returned, and `int64` on a scan answer, where it is the exact match count) and may change width
-  within the range a field holds. A driver decodes `int32`, `int64` and, for codes, any integer type
-  into its integer type.
+  carry an underscore: `write_outcome`, `copies_confirmed`, `served_by`, `state_seq`, `bucket_id`,
+  `decl_version`, `schema_version_seen`, `database_id`, `guard_field`, `document_truncated`,
+  `protocol_version`, `server_version`, `token_expires_at`, `token_deadline`, `password_min_length`. Each
+  is what it is; a driver pins every name in its own request and response types.
+- **Decode any numeric width** for the integer fields of the admin and auth documents. The server sends
+  `int32` or `int64` depending on the field and may change width within the range a field holds. For the
+  ring request and reply documents of section 11.1 the vectors fix the widths (`limit` is `int32`,
+  `epoch` and `state_seq` `int64`), and a codec refuses a widened integer.
 - **Ignore fields you do not know.** The server adds optional fields to answers without a protocol
   version change. A decoder that fails on an unknown field breaks on the next server release.
 - **Absent means absent.** An optional field that is empty is not sent at all; it does not arrive as a
-  zero. The converse holds for a field whose zero is a value: `position` (fifo, lifo) and `priority`
-  (heap) on a field item or a field push answer are sent for those engines even at 0, and are
-  absent only for an engine that has none. A missing `position` or `priority` therefore never means 0.
-- **Documents pass through.** A stored document comes back as a nested BSON document (`data`, `doc`,
-  `documents[]`, `results[]`, `element`), byte for byte as stored. A driver gives it to the caller
+  zero. A heap's `priorities` and a queue's `position` are sent for their stores even at 0, so a missing
+  one never means 0.
+- **Documents pass through.** A stored document comes back as a nested BSON document (`document`,
+  `elements[]`), byte for byte as stored. A driver gives it to the caller
   without re-encoding it.
 - **Field order in a request does not matter to the server.** A driver may send fields in any order and
   may omit an optional field whose value is empty.
@@ -82,132 +79,58 @@ Every message, in both directions, is one frame:
   stored document (at every level) come back in an order the server chooses, which can differ from the
   caller's and between two documents written alike. A driver compares documents field by field, never
   by their bytes, and does not promise its caller an order.
-- **Request fields a driver never sends:** `admitted` (refused `INVALID_ARGUMENT` if a client sets it),
-  and `term`, `db_gen`, `generation`, `generations`, `dropped_generations`, `previous_factor`,
-  `max_document_bytes`, `incarnation`, which are node-to-node fields a client's value is ignored in or overwritten. A
-  vector's `allowed_fields` lists exactly what a driver may send for each request. (`expect_bucket_id`
-  on a find **is** a client's: a cursor echoes the previous page's `bucket_id` in it, so a bucket dropped
-  and re-created between two pages is not read as a continuation.)
+- **A vector's `allowed_fields`** lists exactly what a driver may send for each request. A field a
+  node sends to another node is never a client's.
 
 ## 4. The opcode table
 
-**A response does not always carry the "response" opcode.** Most operations answer with the request's
-own opcode; some have a dedicated response opcode; two observability calls answer `GET_RESPONSE`. Any
-error answer is `ERROR` (`0xA2`) in place of the success opcode. This table is the contract:
+A response does not always carry the request's own opcode, and any error answer is `ERROR` (`0xA2`) in
+place of the success opcode. The opcodes a driver sends:
 
 | Request | Hex | Success response opcode | Payload |
 |---|---|---|---|
 | `AUTH` | 01 | `AUTH_OK` 02, or `AUTH_FAIL` 03 | auth response / auth refusal (`auth.md`) |
-| `PUT` | 10 | `PUT` 10 | insert response |
-| `GET` | 11 | `GET_RESPONSE` 12 | find response |
-| `DELETE` | 13 | `DELETE` 13 | delete response |
-| `EXISTS` | 14 | `EXISTS_RESPONSE` 15 | `{exists}` |
-| `UPSERT` | 16 | `UPSERT_OK` 17 | insert response |
-| `BATCH_PUT` | 20 | `BATCH_PUT_OK` 21 | batch insert response: `{ids[], count, success, results[]}`, `results` one `{id, write_outcome, code?, message?}` per request position, in request order. Still atomic: a `BATCH_PUT` that names one `_id_` twice is refused whole (`DOCUMENT_EXISTS`, `errors.md` section 2) |
-| `BATCH_UPSERT` | 24 | `BATCH_UPSERT_OK` 25 | batch insert response; a repeated `_id_` keeps the last document and every earlier position reports `applied` with the message `replaced by the document at position N of this batch` |
-| `BATCH` | 22 | `BATCH_OK` 23 | `{answers[]}`: one `{opcode, payload}` per item, in item order, each the lone request's own reply (an `ERROR` included). The request is `{items[], writeconcern?}`, each item `{opcode, payload}` with `opcode` a BSON int32 and `payload` the request the item would send on its own. Carried: `FIELD_PUSH`, `FIELD_PUT`, `FIELD_DELETE`, `FIELD_GET`, `FIELD_LEN`, `FIELD_PEEK` and an `UPDATE` of one key; at most 1,000 items and 16 MiB. One write concern, on the envelope, covers every write item, an update's included; an item that names its own, in either spelling, refuses the batch. Not a transaction: each answer says what happened to its item. An `UPDATE` answer past the batch's reply budget carries `doc_omitted: true` and no `doc`. Gated by the `batch` capability (section 6) |
-| `FIFO_PUSH` / `LIFO_PUSH` / `HEAP_PUSH` | 30 / 40 / 60 | same opcode | push response |
-| `FIFO_POP` / `LIFO_POP` / `HEAP_POP` | 31 / 41 / 61 | `FIFO_POP_RESPONSE` 32 / `LIFO_POP_RESPONSE` 42 / `HEAP_POP_RESPONSE` 62 | pop response (`found, items?, message`) |
-| `FIFO_PEEK` / `LIFO_PEEK` | 33 / 43 | same opcode | peek response (`found, items?, message`) |
-| `BTREE_INSERT` | 50 | same opcode | insert response |
-| `BTREE_LOOKUP` | 51 | `BTREE_RESPONSE` 53 | find response |
-| `BTREE_RANGE` | 52 | `BTREE_RESPONSE` 53 | range response |
-| `BTREE_FIRST` / `BTREE_LAST` | 89 / 8A | same opcode | range response |
-| `BLOB_WRITE` | 70 | same opcode | blob write response |
-| `BLOB_READ` | 71 | `BLOB_READ_RESPONSE` 72 | blob read response |
-| `CREATE_DB` / `DELETE_DB` | 80 / 82 | same opcode | `{success, message}` |
-| `CREATE_BUCKET` / `DELETE_BUCKET` | 81 / 83 | same opcode | `{success, message}` |
-| `ALTER_BUCKET` | 8E | same opcode | `{success, message, replication_factor, previous_factor, pending?[], releasing?[]}`; `pending` names the members an increase newly places (they copy the bucket by themselves), `releasing` the members a decrease un-places (their copies are deleted once the others hold everything they hold). The request is `{database, name, replication_factor}`; a driver sends no other field. A server older than this opcode answers `INTERNAL` (default deny, section 5 of `errors.md`) |
-| `LIST_BUCKETS` / `LIST_DATABASES` / `BUCKET_STATS` | 84 / 85 / 86 | same opcode | list / list / stats response |
-| `COUNT` | 87 | same opcode | `{count, message}` |
-| `UPDATE` | 88 | same opcode | update response |
-| `SEARCH` | 8B | same opcode | search response |
-| `SCAN` | 8C | same opcode | scan response |
-| `DISTINCT` | 8D | same opcode | `{values[], message}` |
-| `CONSISTENT_GET` | 9C | same opcode | consistent read response |
 | `PING` | A0 | `PONG` A1 | (empty) |
-| `HEALTH_CHECK` | A3 | **`GET_RESPONSE`** 12 | health response |
-| `LIST_NODES` | A4 | **`GET_RESPONSE`** 12 | node list |
-| `GET_FAST` | C1 | `GET_FAST_RESPONSE` C2 | status byte + BSON (section 5) |
-| `FIELD_PUSH` … `FIELD_LIST` | D0 – D7 | same opcode | field response / field list response |
-| `DECLARE_STORE_FIELDS` | D8 | same opcode | `{success, message?}` |
-| `BUCKET_INFO` | D9 | same opcode | `{found, database, bucket{...}, store_fields?[{name, engine}]}` (one bucket's declaration, no walk) |
-| `QUEUE_CLAIM` | 34 | same opcode | claim response |
-| `QUEUE_ACK` / `QUEUE_RELEASE` / `QUEUE_EXTEND` | 35 / 36 / 37 | same opcode | lease response |
-| `DEAD_LIST` | 38 | same opcode | dead list response (a read) |
-| `DEAD_REQUEUE` / `DEAD_DISCARD` | 39 / 3A | same opcode | dead move response |
-| `DEAD_RESTORE` | 3B | same opcode | restore-only; a client frame carrying it is refused before routing (`PERMISSION_DENIED`, `write_outcome: not_applied`) |
+| `RING_LIST` | DA | `RING_REPLY` DF | section 11.1 |
+| `RING_COUNT` | DB | `RING_REPLY` DF | section 11.1 |
+| `RING_KEYED` | DC | `RING_REPLY` DF | section 11.3 and 11.4 |
+| `RING_ADMIN` | DD | `RING_REPLY` DF | section 11.1 |
+| `RING_TOPOLOGY` | DE | `RING_REPLY` DF | section 11.6 |
+| `RING_BATCH` | E0 | `RING_REPLY` DF | section 11.8 |
+| `RING_GET_MANY` | E1 | `RING_REPLY` DF | section 11.1 |
 
-The field names of every payload are in `operations.md`.
+The ring opcodes carry every verb a driver needs: databases and buckets (`RING_ADMIN`), documents and
+stores (`RING_KEYED`, `RING_BATCH`, `RING_GET_MANY`), listing and counting (`RING_LIST`, `RING_COUNT`) and
+routing (`RING_TOPOLOGY`). Section 11 has the bytes and `operations.md` the meaning of each verb. The
+earlier single-store opcodes (`PUT`, `FIFO_PUSH`, `BLOB_WRITE`, `BATCH_PUT`, `SCAN`, `CREATE_BUCKET` and
+the rest of `0x10` to `0x8F`, `0xC1` and `0xD0` to `0xD9`) belong to the engine the ring replaces. A
+driver does not send them, and this handbook does not document them. A ring node still answers them from
+that earlier engine, which keeps its own databases and buckets: nothing created through them is visible to
+the ring opcodes, and nothing created through the ring is visible to them. They are not part of the API.
+The root package `hoarddb` of the Go module, the Node.js driver and the Python driver send them; the
+package `ring` of the Go module sends the ring opcodes (`api-go.md`).
 
-**Leases and dead entries (`0x34`–`0x3B`).** One set for all three ordered types; the server resolves
-the type from the bucket, as it does for peek, and each answers with its own opcode. `claim` carries
-`database, bucket, limit?, lease_ms?` and answers `found, items?, item_ids?, deliveries?, lease_id?,
-lease_ms?, lease_deadline?, pending?, dead?, returned?, message` plus the write-outcome triple. `ack`,
-`release` and `extend` share `database, bucket, lease_id, item_ids[]?` (ack only) and `lease_ms?`
-(extend only); their answer is `success, lease_state` (`acked`, `released`, `extended`, `expired`,
-`unknown`) with `acked`, `missing`, `remaining`, `released`, `lease_ms` and `lease_deadline` as the verb
-needs them. An `expired` or `unknown` lease is an in-band `success: false`, not an `ERROR` frame and
-never `write_outcome: not_applied`: the same apply may have returned other expired leases. `DEAD_LIST`
-is `database, bucket, limit?, after?` and answers `found, items[{dead_id, data, deliveries, dead_at,
-reason}], next?, message`. `DEAD_REQUEUE` and `DEAD_DISCARD` carry `dead_id?` or `all?` (with `all`, an optional `after?`: a `dead_id`, exclusive,
-where the walk starts; absent is the head of the list) and answer
-`success, done, left?, refused[{dead_id, message}], message?`.
-
-Every member has an explicit `bson` tag. **Server-set members** carry `json:"-"` and are overwritten or
-ignored on a client frame: `lease_now`, `lease_nonce` and `result_ceiling` on `QUEUE_CLAIM`, and
-`lease_now` on a lease verb. A `writeconcern` on any of the seven writes is read from the raw payload,
-as on every data mutation. `DEAD_RESTORE` (`0x3B`) is sent only by a restore's own routing; a client
-that sends it is refused `PERMISSION_DENIED` with `write_outcome: not_applied` and the command to run.
-
-All seven writes declare the cluster feature `queue_claim`: a write is refused before the append while
-a gossiped member does not advertise it. `DEAD_LIST` declares nothing (it is a read).
-
-**Outside the application API** (a driver may expose them in a low-level layer; the vectors do not
-cover them in v1, except user administration, whose wire is vectored in the `users` group, `testing.md` section 1.2): `CLUSTER_ADD` 97, `MIGRATE` 98, `CLUSTER_REMOVE` 99 (operator triggers);
-`DUMP_START`/`DUMP_CHUNK`/`DUMP_DONE` A5–A7 and `RESTORE_START`/`RESTORE_CHUNK`/`RESTORE_DONE` A8–AA
-(backup, root only today); `USER_CREATE` … `USER_REVOKE` B5–BB (user administration: creating a user
-sends a client-derived Argon2id credential, never a plaintext password, so a driver that offers it
-refuses a new password shorter than `AUTH_OK`'s `password_min_length` before deriving; the server
-cannot measure it. The seven payloads, the derivation and the answers are `auth.md` sections 6 and 7).
+**Outside the application API** (the vectors do not cover them): `CLUSTER_ADD` 97, `MIGRATE` 98
+and `CLUSTER_REMOVE` 99 are operator triggers; `DUMP_START`/`DUMP_CHUNK`/`DUMP_DONE` A5 to A7 and
+`RESTORE_START`/`RESTORE_CHUNK`/`RESTORE_DONE` A8 to AA are the backup, root only today. User
+administration with a client-derived Argon2id credential (never a plaintext password) is `RING_ADMIN`'s
+user commands, `auth.md` sections 6 and 7. The codec module `hoarddb-wire` v0.1.0 and the vectors in this
+repository do not carry those commands yet.
 
 **Never sent by a driver.** Node-to-node opcodes are refused on the driver port by name, with
 `INVALID_ARGUMENT` echoing the request ID, and the connection is then closed: `GOSSIP` 90, `REPL_PUSH`
-91, `REPL_ACK` 92, `MIGRATE_START`/`DATA`/`DONE` 93–95, `CLUSTER_PROPOSE` 96, `VERSIONED_GET` 9D, `MEMBERSHIP_CHANGE` 9E,
-`STREAM_OPEN`/`DATA`/`END`/`ACK` B0–B3, `AUTH_CONFIG_PUSH`/`ACK` C4–C5. **Reserved**: `0x04`. Any other
-byte is answered `INTERNAL` ("no authorization rule is declared for opcode … (default deny)").
-
-**The per-type opcode families are aliases on the server.** `FIFO_PUSH`, `LIFO_PUSH` and `HEAP_PUSH`
-all push into whatever store the bucket is; the pops and peeks likewise; `PUT` and `BTREE_INSERT` both
-insert; `GET` and `BTREE_LOOKUP` both read. The server routes by the bucket's store type, not the
-opcode. A driver sends the family that matches the verb and does not look the store type up first;
-which opcode each driver verb sends is pinned by the vectors. Which verb each store type answers and
-which it refuses is the matrix in `operations.md` section 1: the aliasing is wider than the families
-suggest (`PUT` on a queue pushes, `FIFO_PUSH` on a hash is a keyed put), and that matrix is the contract.
-
-## 5. `GET_FAST`: the compact read
-
-An optimisation of `GET` that skips BSON on the request. **Not part of the v1 public API**; a driver may
-use it internally when the server advertises `get_fast`.
-
-- Request payload (not BSON): `1-byte database length, database, 1-byte bucket length, bucket, 2-byte
-  little-endian key length, key`. Maxima 255, 255 and 65,535 bytes.
-- Response `GET_FAST_RESPONSE`: one status byte, `0x00` found or `0x01` not found, followed by the BSON
-  document when found. A miss is not an error.
-- Every failure (a malformed payload, a missing database or bucket, an authorization refusal) is an
-  ordinary `ERROR` frame with an error payload, and **the connection stays open**. Works on a cluster: the
-  server routes it to the bucket's owner.
+91, `REPL_ACK` 92, `MIGRATE_START`/`DATA`/`DONE` 93 to 95, `CLUSTER_PROPOSE` 96, `CLUSTER_PROBE`/`CLUSTER_PROBE_REPLY` 9A and 9B, `VERSIONED_GET` 9D,
+`MEMBERSHIP_CHANGE` 9E, `STREAM_OPEN`/`DATA`/`END`/`ACK` B0 to B3, `AUTH_CONFIG_PUSH`/`ACK` C4 to C5.
+**Reserved**: `0x04`. Any other byte is answered `INTERNAL` ("no authorization rule is declared for opcode
+... (default deny)").
 
 ## 6. Capabilities
 
-`AUTH_OK` carries `capabilities[]`. Today: `pipelining`, `get_fast`, `write_concern`, `consistent_get`,
-`auth_token`, `bucket_rf`, `query_pipelining`, `batch`. A driver records the list at AUTH, **ignores strings it does not know**, and
-refuses to send an option the server did not advertise (with a local error naming the capability)
-rather than send a field an older server drops in silence. `bucket_rf` gates a per-bucket replication
-factor at create; `auth_token` gates tokens (`auth.md`); `batch` gates `BATCH` (a driver whose server does
-not advertise it sends nothing and says to upgrade the server or send the items one at a time; it never
-falls back to lone requests by itself). There is no capability for the write outcome:
-read the fields when they are present (`errors.md`).
+`AUTH_OK` carries `capabilities[]`. A driver records the list at AUTH and **ignores strings it does not
+know**. The server advertises `pipelining`, `get_fast`, `write_concern`, `consistent_get`, `auth_token`,
+`bucket_rf`, `query_pipelining` and `batch`; only `auth_token`, which gates tokens (`auth.md`), concerns a
+ring driver, and the rest name features of the earlier engine. The ring opcodes need no capability, and there is none for
+the write outcome: read the fields when they are present (`errors.md`).
 
 ## 7. Concurrency on one connection
 
@@ -215,21 +138,14 @@ read the fields when they are present (`errors.md`).
   admitted frame **concurrently**. With more than one request in flight, **neither response order nor
   execution order is guaranteed**. A client that writes too far ahead is not refused; the server stops
   reading and TCP backpressure slows it.
-- **v1 drivers are lockstep: one request in flight per connection**, and several connections in a pool.
-  It is provably correct and needs no ordering contract. A driver's connection is nonetheless built as a
-  request-ID demultiplexer (a writer lock, one reader, a table of waiters by request ID) so that raising
-  the in-flight limit later is a constant, not a rewrite.
-- A server that advertises `query_pipelining` promises that queries in flight on one connection run
-  independently, that each request gets exactly one response, that an oversized result leaves the
-  connection and its siblings alone, that a query is abandoned when its client goes away, and that a
-  connection with a request in flight is never closed for idleness. A driver must assume none of those
-  promises from a server that does not advertise it. Closing the connection is the only cancel: a
-  driver that half-closes its write side loses the answers to queries still running. A handler error
-  the server cannot answer (`INTERNAL`) still closes the connection, and the requests in flight on it
-  get no answer.
-- Queries (`SCAN`, `SEARCH`, `BTREE_RANGE`, `COUNT`, `DISTINCT`) wait for node-wide execution slots.
-  Keep latency-sensitive point reads and bulk work (blobs, scans, searches) on **separate connections**:
-  a driver's pool has a point lane and a bulk lane.
+- A driver may keep **one request in flight** per connection (lockstep, with several connections in a
+  pool), which needs no ordering contract, or **pipeline**: send several requests and match each reply
+  to its request by request ID, accepting that replies arrive in any order. Either way the connection is
+  a request-ID demultiplexer (a writer lock, one reader, a table of waiters by request ID).
+- Closing the connection is the only cancel. A handler error the server cannot answer (`INTERNAL`) still
+  closes the connection, and the requests in flight on it get no answer.
+- `RING_LIST` and `RING_COUNT` read every document of a bucket, so they can be slow. Keep
+  latency-sensitive keyed reads and long listings on **separate connections**.
 
 ## 8. Refusals at the connection level
 
@@ -262,59 +178,37 @@ Server defaults (operator-tunable; a driver does not read them from the server):
 - **The server never sends a driver a `PING`.** A driver sends `PING` on idle pooled connections well
   inside the idle timeout (every 60 s is the recommendation) and treats `PONG` as the only proof of
   life; or closes connections it has not used for 120 s. TCP keepalive is a backstop only.
-- **Default pool size is small** (the Go driver: 4 point + 2 bulk per host). The per-address cap is
-  shared by every process on a machine.
-- **A per-request timeout** applies when the caller gives none (the Go driver: 30 s). Without a read
+- **Keep pools small.** The per-address cap is shared by every process on a machine.
+- **A per-request timeout** applies when the caller gives none (the Go client: 30 s). Without a read
   deadline a driver hangs forever on a dropped connection.
-- Do not run a single query that can take longer than the idle timeout on a lockstep connection.
+- Do not run a single request that can take longer than the idle timeout on an otherwise silent connection.
 
 ## 10. Size limits
 
-Server defaults; the operator can change the document, blob and result limits within the ranges
-given, and a driver cannot learn the configured value. A driver therefore enforces **only the frame
-limit** itself and passes the server's refusal through for the rest:
+A driver enforces **only the frame limit** itself and passes the server's refusal through for the rest:
 
-| Limit | Default | Range | When exceeded |
-|---|---|---|---|
-| Frame | 32 MiB | fixed | refused by the driver before sending (section 2) |
-| Document (its own encoded bytes) | 24 MiB | 4 KiB – 30 MiB | `INVALID_ARGUMENT`, message begins `Document "<key>" is …`. Applies to a put, insert, batch member, push, store-field element and the result of an update |
-| Blob | 16 MiB | up to 32 MiB − 64 KiB | `INVALID_ARGUMENT`, message begins `Blob "<key>" is …; this server's limit is …` |
-| Replication fit | payload + key + bucket name + 4 KiB ≤ 32 MiB | fixed | `INVALID_ARGUMENT`, "… too much to replicate … Shorten the key or the metadata." A ~31 MiB document with a long key meets it |
-| One batch, committed atomically | depends on the node's memory table size: about 5 MB at 32 MiB, about 20 MB at the 128 MiB a larger host chooses (`health` reports it as `memtable.batch_bytes`) | per node | the whole batch is refused with an `ERROR` frame, code `BATCH_TOO_LARGE` (`0x11`), nothing was written on a standalone node (`write_outcome: not_applied`; a cluster owner's refusal says `unknown`, `errors.md` section 2); **halve and resend**. A later server splits large batches itself |
-| Query result a node will hold | 16 MiB | 1 – 24 MiB | `RESULT_TOO_LARGE` with `max_result_bytes` and `retained_bytes` (a lower bound; **absent when it is 0**, because the server does not send a zero — most often the first element alone was over the ceiling — so a driver reads absence as 0); **the connection and its other requests are unaffected**; page smaller, project, or narrow the filter |
-| Any response frame | 32 MiB | fixed | replaced by `RESULT_TOO_LARGE` echoing the request ID; treat as above |
-| Database, bucket, typed-field name | 255 bytes of UTF-8 | fixed | refused in-band at create (`success:false`, message gives the length and the limit) |
-| `GET_FAST` names / key | 255 / 65,535 bytes | fixed | refused by the driver before sending |
+| Limit | Value | When exceeded |
+|---|---|---|
+| Frame | 32 MiB (33,554,432 bytes), fixed | refused by the driver before sending (section 2) |
+| A request before AUTH succeeds | 64 KiB, fixed | `INVALID_ARGUMENT`, then the server closes the connection |
+| A document | no limit of its own: it and everything else in its request stay under the frame limit | `INVALID_ARGUMENT` |
+| One `RING_BATCH` or `RING_GET_MANY` | 255 operations, fixed | refused by the driver before sending; the server refuses the frame with `INVALID_ARGUMENT`, nothing written |
+| The answers of one batch | 16 MiB kept whole | answers past the budget are not kept whole; error answers are always kept (section 11.8) |
+| One page of `RING_LIST` | 100 documents by default, at most 10,000 and at most 16 MiB | the page ends early and its cursor continues from there |
+| One page of a store list | 1 to 1000 elements | `INVALID_ARGUMENT` |
+| A peek | 1 to 100 elements | `INVALID_ARGUMENT` |
+| Any response frame | 32 MiB, fixed | replaced by `RESULT_TOO_LARGE` echoing the request ID: ask for a smaller page, project fewer fields, or narrow the filter |
+| Database or bucket name | 255 bytes of UTF-8, fixed | the create is refused before anything is written |
+| A field name | 1 to 255 bytes, fixed | the create or alter is refused |
+| A user name | 1 to 1021 bytes of UTF-8, no control character, fixed | the command is refused |
 
-**The batch bound counts keys and index entries, not large values, and its refusal is `BATCH_TOO_LARGE`.**
-A document of 1 MiB or more counts as almost nothing against `memtable.batch_bytes`, so a lone document
-reaches the byte bound only through its own keys and index entries; one over the document limit is
-refused at the door with `INVALID_ARGUMENT`, before any batch is built. A put or push is refused as
-`Document "<key>" is …` (or `The document is …` when it names no key); a batch is refused naming the
-position, `Document "<key>" (document 1 of the batch) is …` or `Document 1 of the batch is …`, which is
-what a split's one-document batch gets. A split that reaches one document therefore ends in that
-`INVALID_ARGUMENT` frame, or, for a document with tens of thousands of index entries that meets the
-entry-count bound on its own, in `BATCH_TOO_LARGE`; a driver that gets `BATCH_TOO_LARGE` for a
-one-document batch reports it and does not split further.
+## 11. Ring opcodes (0xDA to 0xE1)
 
-A batch of several documents that the store would not commit whole is an `ERROR` frame, code
-`BATCH_TOO_LARGE` (`0x11`), for every bucket type a batch put accepts
-(hash, btree, fifo, lifo, heap) and for both bounds: bytes, and entry count (a batch of many small
-documents runs out of entries before bytes). Its message says `This batch exceeds the largest batch the
-store commits atomically, so none of it was written.`, then how many documents and how many encoded
-bytes the batch was, then the store's bound (`… and … entries` in bytes and entries) and the fix (send
-fewer or smaller documents, or load with `hoarddb ingest`). `write_outcome` is `not_applied` on a standalone
-node and `unknown` on a cluster owner (`errors.md` section 2). A driver splits on the code and on nothing
-in the message. The frame (not the success opcode) is the only shape: an older server answered `BATCH_PUT_OK`
-with `success: false` and no code, which this server never sends. The connection stays open.
-
-## 11. Ring opcodes (0xDA to 0xE0)
-
-The entry-ring client wire: seven opcodes a driver sends to a ring node. Sources, named in plain text:
-`entry-ring-client-wire.md` (client-wire), `entry-ring-conventions.md` (conventions), and
-`entry-ring-queries-and-clients.md` (queries), with the section each statement comes from in brackets, and
-the vector group `ring` in `testdata/driver-vectors/v1.json`. The vectors win for bytes; every place where a
-source disagrees with them is listed in section 11.9. The table of section 4 does not list these opcodes.
+The ring client wire: seven opcodes a driver sends to a ring node, and `RING_REPLY`, their success reply.
+The bracketed references (client-wire, conventions, queries, each with a section) name the server's design
+documents the statement comes from. Those documents are not part of this repository: what a driver can
+check is the vector group `ring` in `testdata/driver-vectors/v1.json` and the codec module
+`github.com/hoarddb/hoarddb-wire`. The vectors win for bytes.
 
 The frame (section 2: 22-byte header, 32 MiB cap), TLS and `AUTH` are unchanged, and `AUTH` comes before any
 ring opcode (client-wire section 4). A refusal is never a `RING_REPLY`: it is `ERROR` (`0xA2`) with the
@@ -327,7 +221,7 @@ payload of section 11.5, so the opcode tells success from refusal (client-wire s
 | `RING_LIST` | DA | `RING_REPLY` DF | request: BSON `{database, bucket, filter?, fields?, limit?, cursor?, epoch?}`, in that member order, **no prologue** (the epoch is a BSON field); reply: `{entries, more?, cursor?, epoch, state_seq}`, `entries` a concatenation of `[slot:2 BE][uvarint idlen][encID][uvarint bodylen][body]` records. Read-only (client-wire section 1; queries Formats) |
 | `RING_COUNT` | DB | `RING_REPLY` DF | request: BSON `{database, bucket, filter?}` and nothing else (a count takes no limit); reply: `{count, epoch, state_seq}`, `count` int64. Read-only (queries Formats) |
 | `RING_KEYED` | DC | `RING_REPLY` DF | request: prologue (20) + class byte (1) + header (40) + class form (section 11.3); reply: the keyed reply of section 11.4 (client-wire sections 1 and 2) |
-| `RING_ADMIN` | DD | `RING_REPLY` DF | request: one BSON command document `{cmd, ...}`; reply: a body of its own per command. Not a read. Commands in client-wire section 1: `create_database`, `create_bucket`, `describe_bucket`, `show_buckets`, `show_databases`, `describe_database`, `describe_node`, `alter_bucket`, `drop_bucket`, `seeding_status`, `seeding_retry`, `seeding_forget`; the per-command layout is `entry-ring-admin-wire.md`, which the vector rows `ring admin: ...` pin (section 11.9) |
+| `RING_ADMIN` | DD | `RING_REPLY` DF | request: one BSON command document `{cmd, ...}`; reply: a body of its own per command. Not a read. Commands in client-wire section 1: `create_database`, `create_bucket`, `describe_bucket`, `show_buckets`, `show_databases`, `describe_database`, `describe_node`, `alter_bucket`, `drop_bucket`, `seeding_status`, `seeding_retry`, `seeding_forget`, the membership commands `join`, `promote` and `replace_node`, and the user commands `create_user`, `alter_user`, `drop_user`, `grant_role`, `revoke_role`, `show_users` and `describe_user` (the server answers them; `hoarddb-wire` v0.1.0 has no encoder for them and no vector row here sends one). There is no `drop_database` or `alter_database`: they are not available yet (`leave` and `remove_node` are refused). The per-command layout is pinned by the vector rows `ring admin: ...` (section 11.9) |
 | `RING_TOPOLOGY` | DE | `RING_REPLY` DF | request: BSON `{epoch, state_seq}`, both int64, no prologue; reply: `{epoch, state_seq, unchanged: true}`, or `{epoch, state_seq, members, witnesses?, voters?, table, databases[{name, id, rf}]}` (section 11.6). Read-only; any authenticated session may call it (client-wire section 4) |
 | `RING_REPLY` | DF | (the success reply of the other six) | BSON, matched to its request by the 16-byte request ID (client-wire section 1) |
 | `RING_BATCH` | E0 | `RING_REPLY` DF | request: prologue (20) once + count byte (1 to 255) + that many `RING_KEYED` write bodies; reply: `{outcome, answers[], epoch, state_seq}` (section 11.8). Not a read (client-wire sections 1 and 7) |
@@ -380,7 +274,7 @@ id and carries no database name (client-wire section 3); a driver learns the ids
 | 02 | `UPDATE` | write | `[encID][opCount:2][op x n][trailer]`, `op = [opCode:1][fieldID:2][valueLen:4][value]`; the trailer is the guard and return byte below |
 | 03 | `UPSERT` | write | the `INSERT` form |
 | 04 | `DELETE` | write | `[encID][trailer]` |
-| 05 | `STORE_VERB` | write | `[encID][fieldID:2][verb:1][argLen:4][arg]`; `verb` 1 push, 2 pop, 3 take, 4 put; `arg` a canonical BSON document (conventions section 9.1) |
+| 05 | `STORE_VERB` | write | `[encID][fieldID:2][verb:1][argLen:4][arg]`; `verb` 1 push, 2 pop, 3 take, 4 put, 5 inc; `arg` a canonical BSON document (conventions section 9.1) |
 | 06 | `CLAIM` | write | `[encID][fieldID:2][count:2][now:8][nonce:16]` |
 | 07 | `ACK` | write | `[encID][fieldID:2][leaseID:16][now:8]` |
 | 08 | `RELEASE` | write | `[encID][fieldID:2][leaseID:16][now:8]` |
@@ -452,17 +346,17 @@ BSON form. **A driver acts on `code` and `detail`, never on the text** (queries 
   `NO_QUORUM` `{voters, answered}`; `LEASE_LAPSED` `{node, lapsed_ms}`;
   `RF_UNSUPPORTED` `{rf, voters, data_members}` (queries Formats).
 - `NOT_FOUND` carries `{expired: bool}` only on a keyed `get` of a document that exists but is past its expire time (`expired: true`); every other `NOT_FOUND` has no detail. A driver tells the two apart by `detail.expired`, never by the message, and a client wrapper such as `IsExpired` still treats both as not found.
-- `CLAIM_PENDING` `{field, holder, claimed_at, age_ms}`; `CLAIM_EXPIRED` `{field, age_ms}`
-  (`entry-ring-indexes.md` section 4.7).
 - `PERMISSION_DENIED` carries no detail and never says whether the bucket exists: one message for a forbidden
   bucket and for an id no database has (client-wire section 3; vector `ring count: a session with no role on
   the database`).
+- Every other code, `RESULT_TOO_LARGE`, `FIELD_TYPE` and `DOCUMENT_EXISTS` included, carries a message and no
+  detail; a ring error with any other member is not canonical. (A `RESULT_TOO_LARGE` frame of the earlier
+  engine also carries `max_result_bytes` and `retained_bytes`; a ring node does not send them.)
 
 The ring also uses the legacy codes `NOT_FOUND` `0x01`, `PERMISSION_DENIED` `0x03`, `INVALID_ARGUMENT` `0x04`,
 `UNAVAILABLE` `0x06`, `RESULT_TOO_LARGE` `0x0E` and `FIELD_TYPE` `0x10` (conventions Errors). The codes
 below are conventions Errors, with the exit status it gives; **Retry** reads the row's own text, and exit 2
-is a refusal the caller corrects, exit 8 one that clears by retrying, waiting or an operator's command
-(`entry-ring-indexes.md` section 4.7):
+is a refusal the caller corrects, exit 8 one that clears by retrying, waiting or an operator's command:
 
 | Code | Name | Exit | Retry |
 |---|---|---|---|
@@ -487,14 +381,13 @@ is a refusal the caller corrects, exit 8 one that clears by retrying, waiting or
 | `0x24` | `RESERVED_NAME` | 2 | no: a bucket name does not begin with `_` |
 | `0x25` | `BUCKET_ID_COLLISION` | 8 | yes: every attempt draws fresh IDs |
 | `0x26` | `SEED_NOT_HELD` | 2 | no: `status seeding <db> <slot>` |
-| `0x27` | `REPLACE_TARGET_HAS_DATA` | 8 | an operator's: `replace-node ... --clear` |
+| `0x27` | `REPLACE_TARGET_HAS_DATA` | 8 | an operator's: restart the node as it is (`replace-node` is for a node started again on an empty ring directory) |
 | `0x28` | `MINT_FAILED` | 8 | yes, or supply an `_id_` |
 | `0x29` | `CORRUPT_KEY` | 2 | no: restart the node and let it be seeded |
 | `0x2A` | `SEED_HELD` | 8 | an operator's: `seeding retry <db> <slot>` |
-| `0x2B` | `CLAIM_EXPIRED` | 8 | send the write again with a new request ID (`entry-ring-indexes.md` section 4.7) |
-| `0x2C` | `CLAIM_PENDING` | 8 | yes, in a moment (`entry-ring-indexes.md` section 4.7) |
+| `0x2B` | `USER_EXISTS` | 2 | no: a user of that name exists; describe it, or choose another name. `hoarddb-wire` v0.1.0 does not know this code |
 
-`0x2B` and `0x2C` are in the indexes spec and not yet in conventions Errors (section 11.9). A forwarded write
+A forwarded write
 whose owner could not be reached is `UNAVAILABLE` `0x06`, exit 8, and **whether it was applied is unknown**: the
 text says to retry with the same request ID, which is safe (conventions Errors).
 
@@ -583,45 +476,30 @@ operation: queries section 4 gives the verdict per operation class, and a lost r
   offered, because renumbered indexes would land on other operations' entries (client-wire section 7.3,
   rule 4; vector `ring batch: the deadline leaves a not-attempted tail`).
 
-### 11.9 Where the specs and the vectors disagree, and vector coverage
+### 11.9 Vector coverage
 
-Where a source and the vectors disagree, the vectors win for bytes:
+Section 3 of this page says to ignore unknown fields and that field order does not matter. For the ring
+opcodes the vectors are stricter: they refuse an unknown member, a different order and a written default
+(section 11.1). Where a design document and the vectors disagree, the vectors win for bytes.
 
-- Queries Formats gives `ListResponse` and `CountResponse` a `stale` and a `stale_position` member; no ring
-  vector reply carries either and their reply member list has neither, so a driver does not require them.
-- Queries Formats' `TopologyResponse` omits `witnesses` and `voters`, which client-wire section 4 and the
-  vectors carry.
-- Client-wire section 1 lists the `RING_ADMIN` commands without `drop_database`, `join`, `promote`, `leave`,
-  `remove_node` and `replace_node`, which the vectors send (the membership and `cluster-manager` rows).
-- Client-wire section 1 says `RING_REPLY` answers "all five" requests, and its table lists six requests; the vectors
-  answer `RING_BATCH` (and `RING_ADMIN`) with `RING_REPLY` too.
-- Client-wire section 3 and conventions Errors stop at `0x2A`; `0x2B` and `0x2C` are only in the indexes
-  spec, and no vector row has either.
-- The vectors' `NOT_OWNER` and `STALE_EPOCH` messages are shorter than the "exact text" of conventions Errors
-  (the vectors check `code`, `detail` and fragments of the message), which is one more reason to act on the
-  code and the detail.
-- Section 3 of this page says to ignore unknown fields and that field order does not matter; for the ring
-  opcodes the vectors refuse an unknown member, a different order and a written default (section 11.1).
+**Vector coverage.** Counted over `testdata/driver-vectors/v1.json` in this repository, rows by
+`request.opcode_name`: the group named `ring` holds 202 rows, 127 exchanges and 75 refusals. Outside that
+group no row sends a ring opcode.
 
-**Vector coverage.** The group named `ring` holds 155 rows, and no other group has a ring opcode or a name
-with `ring` in it (counted over `testdata/driver-vectors/v1.json`, rows by `request.opcode_name`, and
-for `RING_REPLY` by `response.opcode_name`). The group also holds 3 `CLUSTER_PROBE` rows, which are node to
-node and not a ring opcode.
-
-| Opcode | Rows | Exchanges | Refusals |
+| Request opcode | Rows | Exchanges | Refusals |
 |---|---|---|---|
-| `RING_LIST` | 15 | 5 | 10 |
-| `RING_COUNT` | 5 | 2 | 3 |
-| `RING_KEYED` | 32 | 24 | 8 |
-| `RING_ADMIN` | 41 | 25 | 16 |
-| `RING_TOPOLOGY` | 9 | 5 | 4 |
-| `RING_REPLY` (as the response) | 74 | 54 | 20 |
-| `RING_BATCH` | 12 | 7 | 5 |
+| `RING_KEYED` | 65 | 57 | 8 |
+| `RING_ADMIN` | 53 | 37 | 16 |
+| `RING_LIST` | 17 | 7 | 10 |
 | `RING_GET_MANY` | 16 | 11 | 5 |
+| `RING_BATCH` | 12 | 7 | 5 |
+| `RING_TOPOLOGY` | 9 | 5 | 4 |
+| `RING_COUNT` | 5 | 2 | 3 |
 
-`RING_BATCH` has 12 rows by request, 13 with `ring batch reply refused`, a reply-only row. Every ring opcode
-has at least one row. **Not every class byte does:** among the 32 `RING_KEYED` rows the class bytes are `0x81`
-(8), `0x89` and `0x8b` (5 each), `0x05` (3), `0x01`, `0x02`, `0x82` and `0x83` (2 each), `0x88` (1), `0x7f` (an unknown class, 1) and 1
-row too short to have one; **no `RING_KEYED` row carries `0x03`, `0x04`, `0x06`, `0x07`, `0x08`, `0x09`, `0x84`,
-`0x87` or `0x8a`**. The classes inside a `RING_BATCH` or `RING_GET_MANY` body were not counted. No vector pins the slot function or the
-`0x2B` and `0x2C` codes.
+A further 22 rows of the group are refusals with no request: bytes a codec must refuse to decode, replies
+included. The group also holds 3 `CLUSTER_PROBE` rows, which are node to node and not a ring opcode.
+
+Every ring opcode has at least one row, and so does every class byte of section 11.3: the nine write
+classes `0x01` to `0x09`, and the reads `0x81` to `0x84`, `0x87`, `0x88` and `0x89`, with `0x8A` (nearest)
+and `0x8B` (aggregate) of `operations.md` section 4. The classes inside a `RING_BATCH` or `RING_GET_MANY`
+body were not counted. No vector pins the slot function. No row sends a user command (`auth.md` section 6).

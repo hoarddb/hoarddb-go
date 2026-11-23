@@ -10,9 +10,9 @@ After TLS, the driver sends `AUTH` (`0x01`) with this BSON payload:
 |---|---|---|
 | `username` | string | the user |
 | `password` | string | the password; ignored when `token` is non-empty |
-| `protocol_version` | integer | `1`, the protocol major (the ALPN `hoarddb/1`) |
+| `protocol_version` | integer | `1`, the protocol major (the ALPN `hoarddb/1`); `0` means the client did not say, and the Go ring client sends `0` |
 | `capabilities` | array of strings | what the client supports; send `[]` today. **Never send `pipeline_window=<n>`**: it was never implemented. Unknown strings are ignored by the server |
-| `client` | string | the driver's name and version, for the server's logs: `hoarddb-go/<version>`, `hoarddb-node/<version>`; a program may append its own name (the URI's `clientName`) |
+| `client` | string | the driver's name and version, for the server's logs (the Go ring client sends `hoarddb-go`); a program may append its own name (the URI's `clientName`) |
 | `token` | string, optional | a resumption token (section 3); when present, the password in the same frame is ignored |
 
 **Success** is `AUTH_OK` (`0x02`):
@@ -185,202 +185,104 @@ A driver that offers user administration derives the Argon2id credential itself 
 the server never sees the new password and cannot measure it; section 6.2 gives the derivation, the
 payloads and the policy the driver applies.
 
-## 6. User administration: the seven opcodes
+## 6. User administration: the seven `RING_ADMIN` commands
 
-A driver that offers user administration sends `USER_CREATE` (`0xB5`), `USER_ALTER` (`0xB6`),
-`USER_DROP` (`0xB7`), `USER_LIST` (`0xB8`), `USER_GET` (`0xB9`), `USER_GRANT` (`0xBA`) or
-`USER_REVOKE` (`0xBB`). Every field name below is exact (`wire.md` section 3) and every integer is
-decoded at any width. A request carries **no plaintext password**: the driver derives the credential
-itself (section 6.2) and sends only the derived material.
+A driver that offers user administration sends `RING_ADMIN` (`wire.md` section 11.1) with one of the
+commands `create_user`, `alter_user`, `drop_user`, `grant_role`, `revoke_role`, `show_users` or
+`describe_user`. Every member name below is exact, and a request carries **no plaintext password**: the
+driver derives the credential itself (section 6.2) and sends only that. This section describes what the
+v1.1.0 server answers. The codec module `hoarddb-wire` v0.1.0, the Go ring client and the vectors in this
+repository do not carry these commands yet, so a program manages users with the `hoarddb` command line
+(`help create user`, `help alter user`, `help drop user`, `help grant` and `help revoke` show the
+statements). Every command needs the **unscoped** `user-manager` or `root` grant
+(`user-manager@*`): a grant on one database is not enough, for the reads as for the changes.
 
-### 6.1 The payloads
+### 6.1 The requests
 
-A **grant** is one `{role, db}` pair: `role` is one of the eight role names of section 5 and `db` is a
-database name or `*`. Both are strings and both are required.
+A **grant** is `{role, db}`: `role` is one of the role names of section 5 and `db` a database name or
+`*`. An account holds at most 64 grants.
 
-| Request | Fields |
-|---|---|
-| `USER_CREATE` | `request_id` string, `username` string, `credentials` credential document, `roles` array of grants, `enabled` bool (optional; absent means `true`) |
-| `USER_ALTER` | `request_id` string, `username` string, `version` integer, `roles` array of grants (optional), `enabled` bool (optional), `credentials` credential document (optional) |
-| `USER_DROP` | `request_id` string, `username` string |
-| `USER_LIST` | none: send an empty payload |
-| `USER_GET` | `username` string |
-| `USER_GRANT` | `request_id` string, `username` string, `role` grant |
-| `USER_REVOKE` | `request_id` string, `username` string, `role` grant |
-
-`request_id` is a UUIDv4 the driver generates per mutation (create, alter, drop, grant, revoke); the
-master remembers an applied one for ten minutes and answers a repeat with success, which is what makes
-the retry in section 7 safe. `USER_LIST` and `USER_GET` carry none: they change nothing.
-
-A **credential** document is four fields:
-
-| Field | Type | Meaning |
+| `cmd` | Members, in this order | Does |
 |---|---|---|
-| `algo` | string | exactly `"argon2id"`; no other value is accepted |
-| `salt` | string | the salt, **standard base64 with padding** (`A–Z a–z 0–9 + /` and `=`) |
-| `hash` | string | the Argon2id output, **standard base64 with padding** |
-| `params` | document | `memory`, `iterations`, `parallelism`, `salt_len`, `hash_len` (section 6.2) |
+| `create_user` | `name`, `expect_drop_seq` (int64), `roles` (array of grants, may be empty), `credential` | creates the account, enabled. `expect_drop_seq` is the `user_drop_seq` of the last `show_users` or `describe_user` reply; a create is refused `CONFLICT` when a user was dropped since |
+| `alter_user` | `name`, `expect_seq?` (int64), `credential?`, `enabled?`, `roles?` | at least one of `credential`, `enabled` and `roles`. `roles` replaces the whole list; an empty list removes every grant. A password reset is an alter with `credential` alone |
+| `drop_user` | `name`, `expect_seq?` | removes the account |
+| `grant_role` | `name`, `expect_seq?`, `role`, `db` | adds the grant; one already held succeeds and changes nothing |
+| `revoke_role` | `name`, `expect_seq?`, `role`, `db` | removes the grant; one not held succeeds and changes nothing |
+| `show_users` | none | every account, ordered by name |
+| `describe_user` | `name` | one account |
 
-`USER_ALTER` treats `roles`, `enabled` and `credentials` as **optional-with-presence**: an absent field
-leaves that part of the record alone, and an explicitly empty `roles` array replaces the grant set with
-nothing. A password reset is an alter with `credentials` and neither `roles` nor `enabled`; there is no
-separate reset opcode. `version` is always required and is the store's current version (section 6.4);
-an alter whose `version` is stale is refused `CONFLICT`.
+A member a command does not take is `INVALID_ARGUMENT` naming it; a missing required member is
+`INVALID_ARGUMENT` naming it (`create_user` without `expect_drop_seq` says to read it from `show_users`).
+Both fences are `int64`. `expect_seq` is the `revision` the client read for that account; the change is
+refused `CONFLICT` when the account's revision is another. Absent, the server takes the revision it holds.
+
+**The request ID.** A change is sent under the `RING_ADMIN` frame's own 16-byte request ID, a fresh random
+one for each change. A change under an **all-zero ID is refused** `INVALID_ARGUMENT`. Resend a change
+whose answer was lost under the same ID, and the same command on the same account is answered success
+and applied once (the server remembers an ID for ten minutes). The reads need no ID.
 
 ### 6.2 The credential the driver derives
 
-The driver hashes the new password locally and sends the result. A credential is accepted only if it
-was derived like this:
+`credential` is `{algo, salt, hash, memory, iterations, parallelism}`, members in that order:
 
-- **Argon2id**, version `0x13` (19), the only algorithm and version accepted. Argon2i and Argon2d are
-  refused, and so is any string other than `argon2id` in `algo`.
-- **Salt**: a fresh random salt of at least 16 bytes, encoded standard base64 with padding. It must be
-  fresh: a salt another account already stores is refused (section 7). The server derives a login with
-  the **decoded** bytes of `salt`. The server checks, at USER_CREATE and USER_ALTER, that `salt` decodes
-  as standard base64 and that the decoded length equals `params.salt_len` (itself at least 16); a salt
-  that fails either check is refused `INVALID_ARGUMENT` and nothing is created or changed.
-- **Output length**: exactly 32 bytes, encoded standard base64 with padding. `params.hash_len` must be
-  `32`; any other value is refused, and so is a `hash` that does not decode as base64.
-- **Parameters** (`params`, a document):
+| Member | Type | Value |
+|---|---|---|
+| `algo` | string | exactly `argon2id` |
+| `salt` | binary | 16 to 64 bytes, fresh and random; a salt another account already stores is refused |
+| `hash` | binary | exactly 32 bytes, the Argon2id output |
+| `memory` | int64 | KiB, 1 to 2^32-1 |
+| `iterations` | int64 | 1 to 2^32-1 |
+| `parallelism` | int32 | 1 to 255 |
 
-| Field | Type | Accepted range | Default |
-|---|---|---|---|
-| `memory` | integer | 65,536 to twice the server's configured `auth.argon2_memory` (default 64 MiB, so 65,536–131,072) | 65,536 (KiB, i.e. 64 MiB) |
-| `iterations` | integer | at least 3, and at most twice the server's configured `auth.argon2_iterations` (default 3, so 3–6) | 3 |
-| `parallelism` | integer | 1 to 16 | 4 |
-| `salt_len` | integer | at least 16 | 16 |
-| `hash_len` | integer | exactly 32 | 32 |
+Derive with **Argon2id version `0x13`** and the password. The wire checks the shape only: the work-factor
+window an account may use is the server's (`auth.argon2_memory` and `auth.argon2_iterations`), and a value
+outside it is refused `INVALID_ARGUMENT` with a message naming the permitted range. The salt and the hash
+are binary, not base64.
 
-The defaults are the server's own; the driver uses them unless the program says otherwise, and a value
-outside a range is refused `INVALID_ARGUMENT` with a message naming the permitted range. A driver does
-not have to match the server's configured work factor: it must only land inside the range above.
-`memory` is in KiB. Lanes (`parallelism`) split the memory cost rather than multiply it.
+A driver does not send the password, so **the server cannot measure it**: the driver applies the password
+policy itself, before deriving. It refuses a password shorter than `AUTH_OK`'s `password_min_length`,
+counted in Unicode characters, with an error naming the length, the minimum and
+`HOARDDB_PASSWORD_MIN_LENGTH`, and never the password. It uses the number from the server it is connected
+to, never a constant of its own; absent or zero means the server reported none, and the driver refuses
+rather than guess.
 
-A driver does not send the password, so **the server cannot measure it**: the driver applies the
-password policy itself, before deriving. It refuses a password shorter than `AUTH_OK`'s
-`password_min_length`, counted in Unicode characters, with an error naming the length, the minimum and
-`HOARDDB_PASSWORD_MIN_LENGTH`, and never the password. It uses the number from the server it is
-connected to, never a constant of its own; absent or zero means the server reported none, and the
-driver refuses rather than guess. (This is the same rule section 5 states; it is repeated here because
-this is where a new password is chosen.)
+### 6.3 The replies
 
-### 6.3 The answers
+| `cmd` | Members, in order |
+|---|---|
+| `create_user`, `alter_user`, `drop_user`, `grant_role`, `revoke_role` | `name`, `revision` (int64), `result` (one line of text) |
+| `show_users` | `revision`, `user_drop_seq`, `users` |
+| `describe_user` | `user_drop_seq`, `user` |
 
-A **mutation success** (create, alter, drop, grant, revoke) answers with the request's own opcode and
-`{success, message, version, changed?}`: `version` is the store's version after the change (present it
-to the next alter), and `changed` is present **only on a `USER_ALTER` success**: it names the fields the
-request carried and the server applied (`"roles"`, `"enabled"`, `"credentials"`, in that order). A driver that asked
-an alter to change a field requires that field in `changed`, because a server that predates the field
-answers success without applying it; an alter answer carrying no `changed` list is an older server, and
-the driver says so instead of reporting success. A create, drop, grant or revoke answers without
-`changed`; a driver does not require it there. A replayed `request_id` answers
-`duplicate request ignored (already applied)` with success and no `changed`, so a driver checks
-`changed` only on an alter answer whose message is not that one.
-
-`USER_LIST` answers `{users, message?, version?, master?, master_addr?, master_addr_note?}`. `users` is an array ordered by
-username, and each element is `{username, roles, enabled, epoch, created_at, password_changed_at}`:
-`roles` is the grant array, `enabled` a bool, `epoch` an integer (the revocation counter),
-and the two timestamps BSON datetimes. **No hash, salt or pepper is ever in an answer.** `master` and
-`master_addr` name the node that serves mutations (section 7); `master_addr` is the address a client connects to (the master's driver listener), and when it is absent `master_addr_note` says why. Both are optional: an older server sends neither. `USER_LIST` sends an empty request
-payload.
-
-`USER_GET` answers `{found, user, version?, message?}`. A known user is `found: true` with the same
-`user` shape as a `USER_LIST` element. An unknown user is a **success**, not an `ERROR`: `found: false`,
-an empty `user`, the store's `version`, and a `message` such as `user "ada" not found; run 'user list' to
-see the users`. A driver presents `found: false` as its not-found answer, as it does for a `GET` miss
-(`errors.md` section 2).
-
-### 6.4 The `version` an alter presents
-
-`version` is the user store's config version, not a per-user counter: it moves on **every** accepted
-user change anywhere in the store. `USER_LIST` and `USER_GET` both answer it, and both are served by any
-node. An alter whose `version` is not the current one is refused `CONFLICT` (`0x08`); the driver re-reads
-with `USER_GET` and retries. That is coarser than a per-user fence, and deliberately so: two drivers
-editing two different users can refuse each other, and the retry is a re-read.
+A `user` is `{name, roles, enabled, epoch, created_ms, password_changed_ms, revision}`; the times are Unix
+milliseconds. `revision` is what a later change of that account sends as `expect_seq`. **No reply carries a
+salt, a hash or a key.** `describe_user`, or a change, of a user that does not exist is `NOT_FOUND`.
 
 ## 7. User-administration refusals
 
-A driver that offers the user-administration opcodes (`USER_CREATE` B5, `USER_ALTER` B6, `USER_DROP`
-B7, `USER_LIST` B8, `USER_GET` B9, `USER_GRANT` BA, `USER_REVOKE` BB) needs `user-manager` or `root`
-authority, because the server authorizes all seven against the `user-manager` action (section 5). (The
-server's own `-reset-password` flag is an offline command run with the server stopped, not a wire
-request; a driver never sends it and never sees its output.)
+A refusal is an `ERROR` frame (`errors.md` section 1), never a `RING_REPLY`. The `code` names the cause, a
+driver branches on it, and the message names the user or role and the fix and is passed through verbatim.
 
-**A user-administration refusal is an `ERROR` frame (`0xA2`), not an in-band `success: false`.** The
-request's own opcode is used only for a success; a failure carries the shared `ERROR` payload of
-`errors.md` section 1 (`code` and `message`) and never `write_outcome`, `copies_confirmed` or
-`replication_factor`, because a user change is not a data write. The connection stays open. Before
-AUTH succeeds the request is `NOT_AUTHENTICATED` (`0x0C`) like any other.
-
-The `code` of a user-administration refusal names the cause, with the codes the database and bucket
-verbs use (`errors.md` section 2), so a driver branches on the `code`, not on the `message`; the `message`
-names the user or role and the fix, and a driver passes it through verbatim.
-
-| Situation | Code | `message` shape |
-|---|---|---|
-| the caller lacks `user-manager`/`root` | `PERMISSION_DENIED` `0x03` | `permission denied: user "<u>" lacks "user-manager" on "*"`, then the user's roles and `ask an administrator to run: grant role user-manager@* to <u>` |
-| the request arrives before AUTH | `NOT_AUTHENTICATED` `0x0C` | `connection not authenticated; send AUTH first` |
-| `create user` of a name that exists | `ALREADY_EXISTS` `0x02` | names the user, and says to choose another name or `alter user` it |
-| `alter`, `drop`, `grant` or `revoke` on a user that does not exist | `NOT_FOUND` `0x01` | names the user and says `run 'user list' to see the users` |
-| `alter` with a `version` that is not the store's current one | `CONFLICT` `0x08` | names the user, the store's version and the request's, and says to re-read the user and retry |
-| an unknown or retired role name; credential material the server rejects (algorithm, empty salt or hash, a hash or salt that is not base64, a decoded salt whose length is not `params.salt_len`, work factor outside the permitted range); a salt another account already uses; an empty or reserved username; a payload that does not decode as the request's BSON | `INVALID_ARGUMENT` `0x04` | names the user or role and the fix (the valid roles, the permitted range, "choose a fresh random salt", "choose another username") |
-| a change that would leave no enabled `user-manager`, `cluster-manager` or `root`; a `create user` past the user ceiling | `INVALID_ARGUMENT` `0x04` | the reason is in the message: `refusing to remove the last administrator` with `grant that role to another enabled user first`, or `user limit reached` with `remove accounts before adding more` |
-| a mutation on a node that is not the cluster's master; a mutation that cannot reach a quorum; a node whose member list no member has confirmed, whose founder has not answered, or that shares its node id with a second process | `UNAVAILABLE` `0x06` | names the master and its address, the quorum counts, the unconfirmed list, the silent founder (and how to join, start or remove it), or the duplicated node id and that `status` says which process holds it |
-
-`INTERNAL` (`0x05`) is left for a real server fault, such as a users file the server cannot write.
-
-**The last administrator cannot be removed.** The store always keeps at least one **enabled** account
-holding `user-manager`, `cluster-manager` or `root`; `reader`, `writer`, `db-manager`,
-`backup-operator` and `restore-operator` do not count. Three requests can strip that account, and all
-three are refused `INVALID_ARGUMENT` with the message `refusing to remove the last administrator: it is
-the only enabled user-manager/cluster-manager; grant that role to another enabled user first`:
-
-- `USER_DROP` of it;
-- `USER_ALTER` that sets `enabled: false` on it;
-- `USER_ALTER` or `USER_REVOKE` whose new role set no longer holds one of those three roles for it.
-
-The check is made against the state the request would leave, under the store's writer lock, so two
-concurrent drops cannot each see the other's administrator still present and both succeed. A driver
-reports this as a refusal the caller must fix by granting the role elsewhere first; it is never
-retried, and the message is passed through verbatim.
-
-**Retrying a user-administration `UNAVAILABLE`.** The refusal is raised before the store is touched, so
-nothing was applied, although the frame carries no `write_outcome` (a user change is not a data write).
-A driver may retry it with backoff, bounded by the caller's deadline, resending the same `request_id`:
-the server remembers a successfully applied `request_id` for ten minutes and answers a repeat with
-success, so a retry cannot apply the change twice. Two cases differ in *where* to retry. "Not the master"
-is not cured by waiting on the same node: send the command to the master address the message names (or
-find it with `USER_LIST`, which answers `master` and `master_addr`). A node that is not yet confirmed as
-a member, or that shares its node id, clears only when an operator acts, so a driver retries within its
-deadline and then surfaces the message. Every other code in the table is `never` in `errors.md` section 6.
-
-The messages a driver will see:
-
-| Refusal | `message` |
+| Situation | Code |
 |---|---|
-| duplicate name | `create user "ada": user already exists; choose another name, or change the existing account with 'alter user ada ...'` |
-| past the user ceiling | `create user "ada": user limit reached: this store supports N users; remove accounts before adding more, for example 'drop user <name>' ('user list' shows them)` |
-| salt already in use | `create user "ada": credential salt is already in use: choose a fresh random salt (reusing one salt across accounts makes a single leak a lookup table)` |
-| salt not base64, or wrong length | `create user "ada": the credential is not acceptable: credential salt must be standard base64 of salt_len (16+) bytes; the client derives it — check the driver's credential encoding (the salt decodes to 4 bytes but params salt_len is 16); derive the credential again with the 'hoarddb' CLI or a current driver, which build it correctly` |
-| credential out of range | `alter user "ada": the credential is not acceptable: credentials params iterations N is below the minimum of M; derive the credential again with the 'hoarddb' CLI or a current driver, which build it correctly` |
-| reserved username | `create user "node": username is reserved: "node" names the cluster's node identity; choose another username` |
-| empty username | `create user: a username is required; give the account a name: 'create user <name> roles [reader@<database>]'` |
-| unknown user | `drop user "ada": user not found; run 'user list' to see the users` |
-| stale version | `alter user "ada": user config version mismatch: this user store is at version N, the request carried M; re-read the user and retry` |
-| last administrator | `drop user "admin": refusing to remove the last administrator: it is the only enabled user-manager/cluster-manager; grant that role to another enabled user first` |
-| unknown or retired role | `grant role nope@app to "ada": unknown role "nope". The valid roles are reader, writer, …` |
-| not the master | `user changes are served by the cluster master`, then `this node: … (not the master)`, `master: … at …`, and the address to run the command against |
-| no quorum | `no quorum: user changes need a strict majority of the N current cluster members (need M), but only K could be reached; this is retryable …` |
-| payload does not decode | `user create request: payload is not well-formed BSON (…); nothing was changed. Build the request with the 'hoarddb' CLI or a current driver, which send the documented fields` |
+| the caller lacks `user-manager@*` or `root@*` | `PERMISSION_DENIED` (one message for all seven commands; it tells the caller to ask an administrator to run `grant role user-manager@* to <user>`) |
+| `create_user` of a name that exists | `USER_EXISTS` |
+| `alter_user`, `drop_user`, `grant_role`, `revoke_role` or `describe_user` of a user that does not exist | `NOT_FOUND` |
+| a user was dropped since the read (`expect_drop_seq`), or the account changed since the read (`expect_seq`) | `CONFLICT`: re-read with `describe_user` and repeat the change against what it shows |
+| an unknown or retired role; an unacceptable credential; a salt another account uses; an empty or reserved name; more than 64 grants on one account; the user ceiling | `INVALID_ARGUMENT` |
+| a change that would leave no enabled `user-manager`, `cluster-manager` or `root` | `INVALID_ARGUMENT`, `refusing to remove the last administrator ...`; grant the role to another enabled user first. Never retried |
+| a node that does not serve them | `INVALID_ARGUMENT`: send the request to a node started by `hoarddb-server` |
 
-A create/alter/drop/grant/revoke **success** carries the same opcode and a payload with `success`,
-`message`, `version` (present it to the next alter) and, on an alter only, `changed`, the list of
-fields the server applied (section 6.3). A driver that asked an alter to change a field must require
-it in `changed`, because a server that predates the field answers success without applying it. `USER_LIST` answers its
-own list response. **`USER_GET` of an unknown user is a success, not an `ERROR`**: `found: false`, an
-empty `user`, the store's `version`, and a `message` such as `user "ada" not found; run 'user list' to
-see the users`. A known user is `found: true`. A driver presents `found: false` as its not-found
-answer, as it does for a `GET` miss (`errors.md` section 2).
+The last administrator cannot be removed. The store always keeps at least one **enabled** account
+holding `user-manager`, `cluster-manager` or `root`; `reader`, `writer`, `db-manager`, `backup-operator`
+and `restore-operator` do not count. A `drop_user` of it, an `alter_user` that sets `enabled: false` on
+it, and an `alter_user` or `revoke_role` that leaves it without those roles are refused.
+
+**Retry.** Resend a change under the same request ID (section 6.1) after a lost answer or `UNAVAILABLE`:
+a repeat of an applied change is answered success and is not applied twice. Every other code in the table
+is `never` in `errors.md` section 6. In a cluster, users are the cluster's and the limitations page of the server's user
+documentation lists the limits of this build (a member cut off from the others keeps serving the users it last applied).
 
 ## 8. What a user change does to a live session
 
@@ -390,11 +292,11 @@ driver's session handling depends on, so it is stated rather than left to the se
 
 | The change | A token minted before it | Why |
 |---|---|---|
-| a **password** change (`USER_ALTER` with `credentials`) | `TOKEN_INVALID` (`3`) on the next AUTH or refresh | the server bumps the account's revocation counter, and a token whose counter is stale is invalid |
-| the account **disabled** (`USER_ALTER` with `enabled: false`) | `TOKEN_INVALID` (`3`) on the next refresh; the server also **closes that user's live connections** | the counter is bumped, and a disabled account's sessions are closed |
+| a **password** change (`alter_user` with `credential`) | `TOKEN_INVALID` (`3`) on the next AUTH or refresh | the server bumps the account's revocation counter, and a token whose counter is stale is invalid |
+| the account **disabled** (`alter_user` with `enabled: false`) | `TOKEN_INVALID` (`3`) on the next refresh; the server also **closes that user's live connections** | the counter is bumped, and a disabled account's sessions are closed |
 | the account **dropped** | `TOKEN_INVALID` (`3`) on the next refresh; live connections are closed | the token's subject no longer exists |
-| a **role set replaced** by `USER_ALTER` with `roles` and neither `credentials` nor `enabled: false` | still accepted, and the refreshed token carries only the roles both the record and the presented token hold: a removed role is gone, and an added one is not picked up | the counter is not bumped; a refresh narrows to the intersection of the record and the presented token, never widens |
-| one grant **added or removed** by `USER_GRANT` / `USER_REVOKE` (that changed something: granting a grant the user holds, or revoking one it lacks, is a no-op that bumps nothing) | `TOKEN_INVALID` (`3`) on the next AUTH or refresh | each of these bumps the revocation counter; the live connection is not closed, and the password fallback of section 3 mints a token with the new roles |
+| a **role set replaced** by `alter_user` with `roles` and neither `credential` nor `enabled: false` | still accepted, and the refreshed token carries only the roles both the record and the presented token hold: a removed role is gone, and an added one is not picked up | the counter is not bumped; a refresh narrows to the intersection of the record and the presented token, never widens |
+| one grant **added or removed** by `grant_role` / `revoke_role` (that changed something: granting a grant the user holds, or revoking one it lacks, is a no-op that bumps nothing) | `TOKEN_INVALID` (`3`) on the next AUTH or refresh | each of these bumps the revocation counter; the live connection is not closed, and the password fallback of section 3 mints a token with the new roles |
 
 **A revoked token is `TOKEN_INVALID`, never `CREDENTIALS`.** That distinction is what a session handler
 is built on: `TOKEN_INVALID` is the fallback of section 3 (authenticate again with the password, once,
@@ -412,9 +314,9 @@ Two consequences a driver states in its own documentation:
   client's next call authenticates with the password it holds — which is now the old one, so it fails
   `CREDENTIALS`. That is not a driver bug; the program must supply the new password.
 - a role change takes effect at the next AUTH or refresh, not immediately: a call made in the seconds
-  after a revoke may still be authorized with the old grants of the live connection. After `USER_GRANT`
-  or `USER_REVOKE` the next refresh is refused `TOKEN_INVALID` and the password fallback of section 3
-  authenticates with the new roles. After a role set replaced by `USER_ALTER` the refresh succeeds and
+  after a revoke may still be authorized with the old grants of the live connection. After `grant_role`
+  or `revoke_role` the next refresh is refused `TOKEN_INVALID` and the password fallback of section 3
+  authenticates with the new roles. After a role set replaced by `alter_user` the refresh succeeds and
   only narrows: a role newly added appears only on a **new password login**, because a refresh keeps
   what the presented token already carried. A driver that needs new authority now authenticates with
   the password again.

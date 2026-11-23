@@ -1,46 +1,178 @@
-# hoardDB Go driver
+# hoardDB Go client
 
-The Go client for hoardDB: six store types, store fields (every document can carry
-its own queue, table or heap), typed reads, and errors that say what to run next.
-Apache License 2.0.
+The Go module for hoardDB. Apache License 2.0.
 
-> **Status: pre-release.** Every store type, store field, query, blob and batch is
-> implemented and tested against real servers, one node and three. The API can still
-> change between versions.
+> **Status: pre-release (v0.1.0).** The API can still change between versions.
 
     go get github.com/hoarddb/hoarddb-go
 
-Go 1.23 or later. The module requires the public `hoarddb-bson` codec and
-`hoarddb-wire`; nothing else beyond the standard library.
+Go 1.23 or later. The module requires the `hoarddb-bson` codec and `hoarddb-wire`; nothing
+else beyond the standard library.
 
-## Quick start (five minutes)
+## Two packages, and which one to use
 
-**1. Start a server.** It needs no configuration:
+A hoardDB v1.1 server is a ring server. A bucket declares fields, and a field can be a
+store (a queue, a table, a heap) that every document carries for itself. The `hoarddb`
+command line, `hoarddb dump` and `hoarddb restore` work on that data. This module holds
+two clients, and only one of them reaches it.
 
-    hoardDB-server
+| Package | Speaks | Reaches |
+|---|---|---|
+| `github.com/hoarddb/hoarddb-go/ring` | the ring protocol | the data the `hoarddb` command line shows |
+| `github.com/hoarddb/hoarddb-go` (`hoarddb.Connect`) | the opcodes of the server's earlier single-store engine | a separate store on the server, described below |
 
-On first start it prints the root credentials once. At every start it logs the
-fingerprint of its key, which is how you know, later, that you are talking to your
-server:
+**Use package `ring` for new work.** It is the first quick start below.
 
-    === ROOT CREDENTIALS (shown only on first start) ===
-    export HOARDDB_ROOT_USER=admin
-    export HOARDDB_ROOT_PASSWORD='IBMrPyxdoXFEjeK7yq0rxEufy2ZA4e5L'
-    ...
+The root package `hoarddb` was written before the ring. Against a v1.1.0 server:
+
+- **It works.** It connects, logs in with the same users, and reads and writes: the server
+  still answers its opcodes. The second quick start below was run against a v1.1.0 server.
+- **Its data is separate.** Its databases and buckets live in the earlier engine's own store.
+  Nothing it creates is visible to the `hoarddb` command line or to package `ring`, nothing
+  created there is visible to it, and `hoarddb dump` does not include it. A database named
+  `app` can exist on both sides and they are two different databases.
+- **Its data is on one node.** A v1.1.0 server refuses to start in the earlier engine's
+  replicated mode, so on a cluster each node answers these opcodes from its own local store:
+  a write through the root package stays on the node that took it and is not copied to the
+  others. `AlterBucket` to a replication factor above 1 is refused, and a write-concern
+  receipt reports 0 of 0 copies.
+- The `examples/` directory, the `conformance` package and the integration tests use the
+  root package.
+
+## Quick start: package `ring`
+
+**1. Start a server.** Build `hoarddb-server` from
+[`github.com/hoarddb/hoarddb-server`](https://github.com/hoarddb/hoarddb-server) (no release
+binary is published yet) and start it with a root password of your choosing:
+
+    HOARDDB_ROOT_PASSWORD='choose-a-long-password' hoarddb-server
+
+Started from a terminal with no password set, it asks for one instead. The root user is
+`admin`. At every start the server logs the fingerprint of its key, which is how you know,
+later, that you are talking to your server:
+
     {"msg":"TCP driver listener listening","address":"127.0.0.1:7433","fingerprint":"SHA256:8c63...2796", ...}
 
-**2. Trust it.** In another shell, paste the two `export` lines, then name the
-server and its fingerprint (copy the whole value from the log line):
+**2. Trust it.** In another shell, set the password and the fingerprint (copy the whole
+value from the log line):
 
-    export HOARDDB_URI='hoarddb://localhost:7433/app?fingerprint=SHA256:8c63...2796'
+    export HOARDDB_ROOT_PASSWORD='choose-a-long-password'
+    export HOARDDB_FINGERPRINT='SHA256:8c63...2796'
 
-The password stays in the environment, out of the URI.
-
-**3. Connect, create a bucket, put, get.** Make a module:
+**3. Connect, create a bucket, write and read.** Make a module:
 
     mkdir hello && cd hello && go mod init hello
 
 Save this as `main.go` in it:
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"os"
+	"time"
+
+	"github.com/hoarddb/hoarddb-bson/bson"
+
+	"github.com/hoarddb/hoarddb-go/ring"
+)
+
+func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	client, err := ring.Dial(ctx, ring.Options{
+		Addr:        "localhost:7433",
+		User:        "admin",
+		Password:    os.Getenv("HOARDDB_ROOT_PASSWORD"),
+		Fingerprint: os.Getenv("HOARDDB_FINGERPRINT"),
+	})
+	if err != nil {
+		log.Fatal(err) // the message says what to do next
+	}
+	defer client.Close()
+
+	if _, err := client.CreateDatabase(ctx, "app", 0); err != nil {
+		log.Fatal(err)
+	}
+	if _, err := client.CreateBucket(ctx, "app", "User", []ring.FieldDecl{
+		{Name: "Name", Type: "string"},
+		{Name: "Purchases", Type: "fifoStore"},
+	}); err != nil {
+		log.Fatal(err)
+	}
+
+	ada := client.Bucket("app", "User").Entity("ada") // a handle: nothing is sent yet
+	if _, err := ada.Insert(ctx, ring.Doc{"Name": "Ada"}); err != nil {
+		log.Fatal(err)
+	}
+	purchases := ada.Store("Purchases") // Ada's own queue, not a shared one
+	if _, err := purchases.Push(ctx, bson.D{{Key: "item", Value: "coffee"}}); err != nil {
+		log.Fatal(err)
+	}
+	profile, err := ada.Get(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+	waiting, err := purchases.Count(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(profile.Lookup("Name").StringValue(), "has", waiting, "purchase")
+}
+```
+
+Add the driver. This comes after `main.go` on purpose: `go mod tidy` keeps only
+the modules the code imports, so run before `main.go` exists it would drop the
+requirement it was given.
+
+    go get github.com/hoarddb/hoarddb-go
+
+Run it:
+
+    go run .
+    Ada has 1 purchase
+
+A second run stops at `CreateDatabase`, because the database exists: the error is
+`CONFLICT` and its message names the database. `show databases` in the `hoarddb` command
+line now lists `app`, and `show buckets in app` lists `User`.
+
+`go test` compiles every Go block in this file (`readme_test.go`), so what you paste
+is what builds.
+
+### What package `ring` has
+
+- Databases and buckets: `CreateDatabase`, `ShowDatabases`, `DescribeDatabase`,
+  `CreateBucket`, `AlterBucket`, `DropBucket`, `DescribeBucket`, `ShowBuckets`.
+- Documents: `Insert`, `Upsert`, `Update`, `Delete`, `Get`, `GetFields`, `List`, `Count`, and
+  `GetMany` for up to 255 reads in one request.
+- A document's stores: `Push`, `Pop`, `PopN`, `Peek`, `Claim`, `Ack`, `Release`, `Extend` on a
+  `fifoStore` or `lifoStore` field; `Put`, `Take`, `Inc`, `StoreGet` on a `hashStore` or
+  `btreeStore` field; `StoreCount` on any, and `StoreList` on any but a `blobStore`, which the
+  server refuses.
+- `NewBatch` sends up to 255 writes in one request. It is not a transaction.
+- `WithRequestID` makes a retried write safe: the server answers a request ID it has already
+  applied from its dedupe window instead of applying the write twice.
+
+What it does not have yet: a connection URI, a connection pool, tokens, user
+administration (use the `hoarddb` command line), a push to a `heapStore` field, and
+routing by the ring (it talks to the node it dialled, which forwards). The package
+documentation (`go doc github.com/hoarddb/hoarddb-go/ring`) and `handbook/api-go.md` have
+the whole API; `handbook/` describes the protocol.
+
+## Quick start: the root package `hoarddb`
+
+This is the earlier-engine client described above. Everything from here to "Packages"
+is about it. With the server of step 1 running, name the server and its fingerprint in a
+URI; the user defaults to `admin` and the password is read from `HOARDDB_ROOT_PASSWORD`:
+
+    export HOARDDB_URI='hoarddb://localhost:7433/app?fingerprint=SHA256:8c63...2796'
+
+The password stays in the environment, out of the URI. Save this as `main.go` in a module
+as above, `go get github.com/hoarddb/hoarddb-go`, and `go run .`:
 
 ```go
 package main
@@ -89,24 +221,15 @@ func main() {
 }
 ```
 
-Add the driver. This comes after `main.go` on purpose: `go mod tidy` keeps only
-the modules the code imports, so run before `main.go` exists it would drop the
-requirement it was given.
-
-    go get github.com/hoarddb/hoarddb-go
-
-Run it:
-
     go run .
     Ada is 36
 
-`go test` compiles every Go block in this file (`readme_test.go`), so what you paste
-is what builds. The `examples/` directory has a runnable program for each store type;
+The `examples/` directory has a runnable program for each store type of this package;
 each reads `HOARDDB_URI` and prints what it did.
 
-## The six store types
+## The root package: six store types
 
-A bucket has one store type. The same verb has the same name, argument order and
+In the root package a bucket has one store type. The same verb has the same name, argument order and
 result shape on every type that answers it. The full table is in the package
 documentation (`go doc github.com/hoarddb/hoarddb-go`):
 
@@ -170,20 +293,17 @@ if err := jobs.Drop(ctx); err != nil {
 }
 ```
 
-### Change how many copies a bucket keeps
+### Copies of a bucket
 
-On a cluster, `Database.AlterBucket` raises or lowers a bucket's replication factor. It needs the
-`bucket_rf` capability. The answer comes when the bucket's owner has recorded the change; `Pending`
-names the members that will copy the bucket by themselves, and `Releasing` the members whose copies
-are deleted once the others hold everything they hold. A refusal an operator must act on (a factor
-larger than the cluster) is `ErrInvalidArgument` with the server's sentence; one a retry clears is
-`ErrUnavailable` with `OutcomeNotApplied`, which the driver retries with backoff until your deadline.
-Runnable: `go run ./examples/alter`.
+`Database.AlterBucket` asks for a bucket's replication factor to be raised or lowered. A v1.1.0
+server refuses a factor above 1 for this package's buckets with `ErrInvalidArgument`: the earlier
+engine runs on one node only (see "Two packages" above). Copies are a property of a ring
+database, set when it is created with package `ring` or the `hoarddb` command line.
 
 ```go
 result, err := client.Database("app").AlterBucket(ctx, "orders", hoarddb.AlterBucketOptions{ReplicationFactor: 3})
 if err != nil {
-	log.Fatal(err) // the message says what to run
+	log.Fatal(err) // on v1.1.0: the server's sentence says it has no second node for this bucket
 }
 fmt.Println(result.PreviousFactor, "->", result.ReplicationFactor, "copying to", result.Pending)
 ```
@@ -323,8 +443,9 @@ does not decode into your type is `ErrInvalidArgument`, naming the key and the f
   an unencoded one can change which host the credentials go to. The driver never prints a password or
   token, in an error or a log line.
 - **Several hosts** are tried in the order written; the first that completes TLS and
-  login wins. A host that fails is skipped for a while. This is a fallback for a
-  node that is down, not load balancing.
+  login wins. A host that fails is skipped for a while. **Against a v1.1.0 server, name one
+  host:** each node keeps its own store for this package's data, so a second host is a
+  different, separate set of buckets and not a fallback.
 - **Parameters:** `fingerprint`, `authToken`, `clientName`, `dialTimeoutMs`
   (default 10000, per host). Anything else is an error that names the accepted ones.
   Settings that weaken security, such as `insecure` and `tls`, are refused in a
@@ -349,7 +470,7 @@ nothing weaker. In the order a developer meets them:
 4. **`hoarddb.AcceptFirstSight`**, a ready-made prompt that trusts and records the
    first key a host shows, as SSH does. Local development only.
 5. **`WithInsecureSkipVerify(reason)`** turns the check off. The reason is required
-   and is logged at `WARN` when the client connects (see issue #6 below). It cannot be set from a URI.
+   and is logged at `WARN` when the client connects (see "Known issues"). It cannot be set from a URI.
 
 `examples/trust` shows the pinned path end to end.
 
@@ -405,7 +526,7 @@ default:
 }
 ```
 
-A refused write says whether it happened, on a single node as on a cluster:
+A refused write says whether it happened:
 `Error.Outcome` is `OutcomeNotApplied` for a refusal decided before anything was
 applied (a missing bucket, a permission, the document limit, a duplicate key), and
 a server-stamped outcome is passed through untouched. Where no answer vouches for
@@ -413,7 +534,7 @@ a write, `Error.Outcome` is `OutcomeUnknown` and the message ends with the drive
 "unknown outcome" advice after the server's sentence: a lost connection, a refusal
 with no request ID, and an ordinary error frame on a data write (a put, insert,
 push, pop, delete, update or blob or store-field write) that carries no stamp,
-which an older server or a single node whose own store failed the write sends.
+which a node whose own store failed the write sends.
 Read the data back before resending. `OVERLOADED` as the server's refusal of a
 connection (one error frame with an all-zero request ID, then a close) serves nothing,
 so the driver backs off and sends the request again, a write included; a data write
@@ -431,7 +552,7 @@ with an error frame, a read, and a login report no outcome, and an in-band refus
 for display only.
 
 The driver retries only what is safe to send twice: a read whose connection failed,
-once, on a fresh connection; a read the cluster cannot answer yet, or a request the
+once, on a fresh connection; a read the server cannot answer yet, or a request the
 server says it did not apply (`OutcomeNotApplied`), with backoff until your deadline;
 a connection refused for load. It **never** resends a write whose outcome is unknown
 (`OutcomeUnknown`: a push, a pop, an update, an increment) and **never retries a
@@ -443,9 +564,9 @@ one `WithRequestTimeout` (30 s) applies.
 
 ### Write concern
 
-On a cluster, a write is answered after `one`, `majority` or `all` copies hold it.
-Set a default for the client or a level for one call; the receipt says how many
-copies confirmed:
+`WithWriteConcern` (`One`, `Majority`, `All`) asks for a write to be answered after that many
+copies hold it. Against a v1.1.0 server this package's buckets have one copy, so every level
+behaves the same and the receipt reports no copies:
 
 ```go
 users := client.Database("app").Bucket("User")
@@ -453,10 +574,8 @@ receipt, err := users.Upsert(ctx, "bob", hoarddb.Map{"Name": "Bob"}, hoarddb.Wit
 if err != nil {
 	log.Fatal(err)
 }
-fmt.Println(receipt.CopiesConfirmed, "of", receipt.ReplicationFactor) // 0 of 0 on a single node: not reported
+fmt.Println(receipt.CopiesConfirmed, "of", receipt.ReplicationFactor) // 0 of 0: not reported
 ```
-
-A single node has no replicas, so every level behaves the same there.
 
 ## Concurrency, the pool and what a handle costs
 
@@ -474,70 +593,68 @@ small struct holding a name and a pointer; `Bucket.Field` likewise. They do no I
 and hold no connection, goroutine, timer, cache entry or metric, and the driver adds
 no per-bucket metric (`PoolStats` is aggregate). A program that holds a million
 handles holds a million small structs, and whether a bucket exists is learned by the
-first call that uses it. hoardDB is built for very many small buckets, one per
-entity, and the driver keeps nothing per bucket to match.
+first call that uses it. hoardDB is built for many small buckets, thousands per node,
+and the driver keeps nothing per bucket to match.
 
 `ListBuckets` answers a whole database in one frame, with no paging: it is an
 **operator call**, for a person at a prompt or a setup script, not something to run
-per request. On a cluster `ListBuckets` and `ListDatabases` answer for the node you
-are connected to.
+per request. `ListBuckets` and `ListDatabases` answer for the node you are connected
+to, and list this package's databases only, never the ring's.
 
 ## Support
 
-| Driver | Server | Wire | Capabilities the driver uses |
+| Client | Server | Wire | What was run |
 |---|---|---|---|
-| this checkout (pre-1.0, unreleased) | the test server built from commit `e26d6bf2`, named in `testing/server.json`, and later | protocol 1 (ALPN `hoarddb/1`) | `auth_token` (tokens instead of passwords after login), `write_concern`, `consistent_get` (`Consistent()` reads), `bucket_rf` (`WithReplicationFactor`, `AlterBucket`) |
+| package `ring`, v0.1.0 | hoardDB v1.1.0 | protocol 1 (ALPN `hoarddb/1`), the ring opcodes | the first quick start of this file, against a v1.1.0 server |
+| root package `hoarddb`, v0.1.0 | hoardDB v1.1.0, the earlier engine's store only | protocol 1, the earlier engine's opcodes | the second quick start of this file and the thirteen programs under `examples/` other than `gin`, against a v1.1.0 server. The integration and conformance suites were last run against the server commit named in `testing/server.json`, which is older than v1.1.0, and have not been re-run against v1.1.0 |
 
-A capability the server does not advertise is never sent: the call returns
-`ErrUnsupportedByServer` naming the capability and the server's version, and nothing
-goes on the wire. The driver is lockstep (one request per connection) and does not use
-`pipelining` or `get_fast`. Unknown capabilities are ignored. CI runs the whole suite
-against the pinned binary on one node and on three.
+The root package uses these server capabilities: `auth_token` (tokens instead of passwords
+after login), `write_concern`, `consistent_get` (`Consistent()` reads) and `bucket_rf`
+(`WithReplicationFactor`, `AlterBucket`). A capability the server does not advertise is never
+sent: the call returns `ErrUnsupportedByServer` naming the capability and the server's version,
+and nothing goes on the wire. The root package is lockstep (one request per connection) and
+does not use `pipelining` or `get_fast`. Unknown capabilities are ignored.
 
-## Not in v1
+## Not in v1.1
 
-User administration, backup and restore, and cluster operations (the unstable
-`hoarddbwire` package can send them; the public API does not); routing by the ring in
-this package (a `hoarddb.Client` talks to any node; package `ring` is the client that
-routes by the ring); caller-visible pipelining; an object mapper or a query
-builder. A secondary index exists on hash buckets only, because that is what the
-server offers; `Search` answers on every type but blob, from an index where one
-serves the filter and by a full scan otherwise.
+What the root package does not do against a v1.1 server: reach the ring's data (package
+`ring` does); user administration, backup and restore, and cluster operations (the unstable
+`hoarddbwire` package can send the earlier engine's opcodes for them; the public API does
+not); caller-visible pipelining; an object mapper or a query builder. A secondary index
+exists on hash buckets only, because that is what the earlier engine offers; `Search` answers
+on every type but blob, from an index where one serves the filter and by a full scan otherwise.
 
 ## Known issues
 
-Open, and not fixed here:
-[#5](https://github.com/hoarddb/hoarddb-go/issues/5) an unreadable `known_servers` is
-reported as unreachable, not untrusted;
-[#6](https://github.com/hoarddb/hoarddb-go/issues/6) the insecure reason is not yet
-logged on every attempt;
-[#7](https://github.com/hoarddb/hoarddb-go/issues/7) the same-host key-conflict message
-can read oddly;
-[#8](https://github.com/hoarddb/hoarddb-go/issues/8) a `known_servers` file owned by
-another user is not refused;
-[#10](https://github.com/hoarddb/hoarddb-go/issues/10) the dropped-user authentication
-case is skipped in tests;
-[#21](https://github.com/hoarddb/hoarddb-go/issues/21) the test helper can lose a port
-race ("address already in use");
-[#22](https://github.com/hoarddb/hoarddb-go/issues/22) the pool can hand out an idle
-connection the server already closed, which shows as one failed call under load.
+Open, and not fixed here, all in the root package:
+
+- an unreadable `known_servers` is reported as unreachable, not untrusted;
+- the insecure reason is not yet logged on every attempt;
+- the same-host key-conflict message can read oddly;
+- a `known_servers` file owned by another user is not refused;
+- the dropped-user authentication case is skipped in tests;
+- the test helper can lose a port race ("address already in use");
+- the pool can hand out an idle connection the server already closed, which shows as one
+  failed call under load.
 
 ## Packages
 
 | Package | Purpose | Stability |
 |---|---|---|
-| `github.com/hoarddb/hoarddb-go` | `Connect`, `Client`, buckets, options, errors | the API to use |
+| `github.com/hoarddb/hoarddb-go/ring` | the ring client: `Dial`, `Client`, `Bucket`, `Entity`, `Store`, `Batch` | pre-release; the one to use for new work |
+| `github.com/hoarddb/hoarddb-go` | the earlier-engine client: `Connect`, `Client`, buckets, options, errors | pre-release |
 | `.../hoarddbwire` | frames, opcodes, error codes, `Conn`; `.../hoarddbwire/trust` | **unstable**, for tools that speak the wire |
 
 ## Dependencies and licences
 
-The standard library, and one BSON codec (Apache-2.0) used only behind
-`internal/codec`; none of its types appear in this package's API. See `NOTICE`. The
-driver does not import anything from the server, which has a different licence;
-`go test` fails if it ever does, and `scripts/compliance-check.sh`  checks
-the licence of every package the module builds, that the dependency graph is the
-standard library, this module and the codec, and that no other database product is
-named in the tree. The Gin example is a separate module and adds nothing to this one.
+The standard library, the BSON codec `github.com/hoarddb/hoarddb-bson` and the ring codec
+`github.com/hoarddb/hoarddb-wire`, both Apache-2.0. The root package uses the BSON codec only
+behind `internal/codec`, and none of its types appear in that package's API; package `ring`
+returns documents as the codec's `bson.Raw`. See `NOTICE`. The module imports nothing from the
+server, which has a different licence; `go test` fails if it ever does, and
+`scripts/compliance-check.sh` checks the licence of every package the module builds and that
+no other database product is named in the tree. The Gin example is a separate module and
+adds nothing to this one.
 
 This driver is Apache License 2.0; see `LICENSE`.
 
@@ -546,18 +663,20 @@ This driver is Apache License 2.0; see `LICENSE`.
     go vet ./... && go test -short ./...
 
 `-short` skips the tests that need a running hoardDB server. To run them, build
-`hoardDB-server` from the hoardDB server repository and point the tests at the binary
-(a test-server download is not available yet):
+`hoarddb-server` and the `hoarddb` command line from the hoardDB server repository and point
+the tests at the binaries (a test-server download is not available yet):
 
-    export HOARDDB_SERVER_BIN=/path/to/hoardDB-server
+    export HOARDDB_SERVER_BIN=/path/to/hoarddb-server
     export HOARDDB_CLI_BIN=/path/to/hoarddb
     go test -race ./...
 
-The integration tests start `hoardDB-server` on loopback with a fresh data directory
-and stop it afterwards. Without `HOARDDB_SERVER_BIN` they fail; `-short` skips them for a quick loop. `HOARDDB_CLI_BIN` is the `hoarddb`
-command-line client: a test that needs a second user has it create one, because the driver
-does not derive the Argon2id credential `USER_CREATE` carries. `go test ./conformance/...`
-runs the frozen vectors (`../testdata/`, beside this module) against the driver's codec and a real server.
-`TestLeg3Replay` starts one server per vector, about 4 seconds each, and takes about
-16 minutes: run the conformance leg with `-timeout 45m`, because Go's default of 10
-minutes ends it with a panic that looks like a driver failure.
+The integration tests start the server on loopback with a fresh data directory and stop it
+afterwards. Without `HOARDDB_SERVER_BIN` they fail. `HOARDDB_CLI_BIN` is the `hoarddb`
+command-line client: a test that needs a second user has it create one. They were written
+against the server commit named in `testing/server.json` and drive the root package; they
+have not been re-run against v1.1.0, and the three-node tests and `testing/compose/` start
+the earlier engine's replicated mode, which a v1.1.0 server refuses at start.
+`go test ./conformance/...` runs the frozen vectors against the driver's codec and a real
+server. `TestLeg3Replay` starts one server per vector: run the conformance leg with
+`-timeout 45m`, because Go's default of 10 minutes ends it with a panic that looks like a
+driver failure.

@@ -12,8 +12,27 @@ pass against a real server, and each test was seen to fail before the code that 
 | `testdata/uri-vectors/v1.json` | **hand-maintained** (a URI never crosses the wire) | connection URIs that parse, and that are refused (`trust.md` section 6); an invalid case may carry `error_excludes`, substrings that must appear nowhere in the error message or its wrapped causes |
 | `testdata/bson-vectors/v1.json` | **generated**, by the server's own BSON package, with no server running | the BSON byte layer: the bytes of every type and edge, malformed inputs, size limits (section 1.3) |
 | `testdata/trust-vectors/v1.json` | **generated**, by the server's own `known_servers` code, with no server running | the `known_servers` rules of `trust.md` section 4: canonical host form, line grammar, lookup, saving, file safety (section 1.4) |
+| `testdata/driver-vectors/ring-constants.json` | **generated**, from the codec module `hoarddb-wire` | the ring opcodes, class bytes, codes and limits as numbers, for a driver that does not import the Go codec |
+| `testdata/driver-vectors/ring-inputs.json` | **generated**, from the ring request rows of `v1.json` | one input per ring request row, in the form the codec's `ringvec` command reads; each input encodes to exactly that row's `payload_hex` |
+| `testdata/driver-vectors/consume-constants.json` | hand-maintained | the claim and lease limits and the backoff numbers of the earlier engine's consume loop |
 
-All four are Apache-2.0 and are shared by every driver repository and read-only there. A driver never edits them
+**The `ring` group of `driver-vectors/v1.json` is the driver contract** (`wire.md` section 11), with the
+`auth`, `trust`, `frame` and `session` groups and the `decode` rows that are not specific to the earlier
+engine (the error with no code, a code the driver does not know, the `AUTH_FAIL` reasons, the
+connection-level refusals and the oversize answer). The file also still holds rows captured from the
+server's earlier single-store engine, and they are not part of the driver contract: the groups `write`,
+`ddl`, `read`, `query`, `store-fields`, `batch-request`, `cluster` and `users`; the rows of `errors`,
+`limits` and `wire-names` that send `PUT`, `GET`, `SCAN`, `FIFO_*`, `QUEUE_*`, `BLOB_WRITE`, `BATCH`, `CREATE_BUCKET` and
+the other opcodes of that engine; the one `bson` row, which is a captured `GET` answer; and the `decode`
+rows for its own codes and messages (`RESULT_TOO_LARGE` carrying `max_result_bytes` and `retained_bytes`,
+`BATCH_TOO_LARGE`, `TIMEOUT`, `delete answered skipped`). A ring driver does not send those opcodes and
+does not replay those rows. A ring node still answers them from the earlier engine, so a runner that does
+replay them gets answers from that engine and not from the ring. The root package `hoarddb` of the Go
+module is such a runner. The `cluster` rows, and every row whose `topology` is `cluster3`, were captured
+on the earlier engine's replicated mode, which a v1.1.0 server refuses to start in: they can be decoded,
+and they cannot be replayed against it.
+
+All of them are Apache-2.0 and are read-only in a driver repository. A driver never edits them
 (handbook `README.md`, "Changing this handbook").
 
 ### 1.1 `driver-vectors/v1.json`: the format
@@ -87,8 +106,8 @@ frame, must produce `frame_hex` byte for byte.
   each expected to succeed. Every exchange uses its own database name (`v001`, `v002`, …), so vectors
   are independent; the harness runs each one against a **fresh** server of its own, started with
   `server_env` and the vector's own `server_env` (an operator limit the vector needs, such as a small
-  document limit), on the vector's `topology`: `single`, or `cluster3` (section 3.2; the vector is sent
-  to `node1`, or to the node its notes name). A `users` row also needs a server of its own holding no
+  document limit), on the vector's `topology`: `single`, `static` (a ring vector with no server behind it) or `cluster3`
+  (three nodes of the earlier engine's replicated mode, which v1.1.0 no longer starts; section 3.2). A `users` row also needs a server of its own holding no
   account but the root one, so that its `setup` starts from a user store nothing else has touched
   (section 1.2).
 - **A lease id is a placeholder the setup fills.** The server mints lease ids, so a `lease_id` naming
@@ -154,49 +173,32 @@ must compute from the key, and from the certificate), or a `known_servers` case 
 
 ### 1.2 What the vectors cover
 
-One exchange per client-facing opcode and per store type it applies to; the miss and refusal shapes
-(`found: false`, `success: false`); every error code the server sends; the AUTH success, every
-`AUTH_FAIL` reason and the empty payload; the oversize-request answer; the size refusals; every
-`create bucket` declaration key; the field-store verbs; the write outcome on a three-node cluster (an
-`all` write with one node stopped, answered with `copies_confirmed` below `replication_factor`; the
-refusals of a node not yet added); one vector per wire name that is easy to get wrong (`writeconcern`,
-`addtoset`, `blobid`, `bucketcount`, `nodeid`, `joinedat`, `schemajson`); BSON edge values
-(datetime to the millisecond, object id, every binary subtype in use, `int32` against `int64`,
-`decimal128`); the delete request's `expire_if` and the response's `spared` and `skipped`.
+The `ring` group has at least one exchange per ring opcode and the refusals a strict decoder must make
+(`wire.md` section 11.9 counts the rows); the AUTH success, every
+`AUTH_FAIL` reason and the empty payload; the oversize-request answer; and BSON edge values (datetime to
+the millisecond, object id, every binary subtype in use, `int32` against `int64`, `decimal128`).
 
 What is deliberately not a vector, and where it is tested instead:
 
 - Query pipelining (not offered by any server yet), and a server that **does not** answer (a bad
   version byte): there is no response to freeze; that is a harness leg.
-- Anything whose request or setup is tens of megabytes, because the file would be: a 16 MiB binary
-  value, the replication-fit refusal (a ~31 MiB document), the response-frame guard, and a batch over
-  the atomic bound (about 5 MB). Leg 6 provokes them live.
-- Refusals a test cluster cannot provoke deterministically (a membership change under a write, a read
-  at a node that does not hold the bucket, `CONFLICT`); `errors.md` names them, and a driver handles
-  them by code and `write_outcome`, which the decode vectors pin.
-- User administration (`USER_CREATE` … `USER_REVOKE`, B5–BB) is outside the v1 application API, but
-  its wire is vectored in the `users` group: one row per opcode's success, the credential refusals
-  (iterations below the minimum, a reused salt, a salt that is not base64, a salt whose decoded
-  length is not `salt_len`), a stale `version` (`CONFLICT`), a duplicate name, an unknown user, and the
-  last-administrator guard. The credentials in those rows are derived the way a driver must derive
-  them (`auth.md` section 6.2: Argon2id, the documented defaults, a fixed salt per account) and no row
-  carries a password. Each row is answered on a server of its own whose only account is the root user
-  of `server_env` before the row's `setup` runs: `user list`'s answer is exactly the root account
-  beside the row's `ada`, and the last-administrator guard turns on what else the store holds, so a
-  server still carrying the previous row's accounts changes the answer. The rows that change an
-  account between a token's mint and its use
-  (`auth with a token minted before a password change`, `... before a grant`, `... after a roles-only
-  alter`, `write after a roles-only alter narrowed the refresh`) have `replay: false`: the account and
-  the change are made on the server's side, so they are decode vectors, and leg 8 exercises the
-  behaviour live (a dropped user's connections close and the next call reports the refusal).
+- Anything whose request or setup is tens of megabytes, because the file would be: a request near the
+  32 MiB frame limit and the response-frame guard. Leg 6 provokes them live.
+- Refusals a test cluster cannot provoke deterministically (a membership change under a write, a
+  forwarded write whose owner is unreachable, `CONFLICT`); `errors.md` names them, and a driver handles
+  them by code and `detail`, which the decode vectors pin.
+- User administration through `RING_ADMIN` (`auth.md` section 6) has no vector row in this repository.
+  The `users` group holds rows of the earlier engine's user opcodes (`USER_CREATE` to `USER_REVOKE`, B5 to
+  BB) and the rows that change an account between a token's mint and its use; the latter have
+  `replay: false`, because the account and the change are made on the server's side.
 
 ### 1.3 `bson-vectors/v1.json`: the BSON codec corpus
 
 A driver that writes its own BSON codec (Python and C++) is held to this file **byte for byte**. A
 driver that uses a library for BSON does not need it. The bytes were written by the server's own
-encoder and read by its decoder, never typed in by hand, and the generator is committed beside the
-server (`make bson-vectors`; `make bson-vectors-check` and `go test ./cmd/gen-testvectors` fail when
-the file and the encoder disagree, so a byte can only change in a reviewed diff).
+encoder and read by its decoder, never typed in by hand, and the generator lives beside the
+server, where a check fails when the file and the encoder disagree, so a byte can only change in a
+reviewed diff.
 
 The header has `format` (`hoarddb-bson-vectors/1`), `server_commit`, `generated_by`, `limits` (the
 depth limit and the frame and document sizes the vectors sit on) and two glossaries, `value_forms` and
@@ -233,15 +235,14 @@ strings, booleans, null and arrays are plain JSON. Every vector is one line, wit
   driver may send it.
 
 A driver replays the file in its unit layer (section 4, no server needed) and reports each failing
-vector by `name`. The file is shared by every driver repository and read-only there, like the others, and a
+vector by `name`. The file is read-only in a driver repository like the others, and a
 driver never edits it; a change a driver needs is a change to the generator.
 
 ### 1.4 `trust-vectors/v1.json`: the `known_servers` rules
 
 Every driver that reads or writes `known_servers` is held to this file. It was generated from the Go
-implementation the CLI and the server use (`hoardDB/transport`), never typed in by hand
-(`make trust-vectors`; `make trust-vectors-check` and `go test ./cmd/gen-testvectors` fail when the file
-and the code disagree). The header has `format` (`hoarddb-trust-vectors/1`), `server_commit`,
+implementation the CLI and the server use, never typed in by hand; a check beside the server fails when
+the file and the code disagree. The header has `format` (`hoarddb-trust-vectors/1`), `server_commit`,
 `generated_by`, `default_port`, `lock_wait_seconds`, and `keys`: two fixed ed25519 public keys, `a` and
 `b`, with their hex and fingerprint, which the file texts below are built from. Every vector is one line
 with `name`, `group` and optional `notes`. The groups:
@@ -272,45 +273,57 @@ One runner per driver, in the driver's own repository and language (Go: a `confo
 `go test`), reporting one line per leg. Every driver must be green on every leg; it is the gate for every
 later language too.
 
+The Go repository's `conformance` package predates the ring: its server legs drive the root package
+`hoarddb`, so they exercise the earlier engine, and its ring coverage is the codec (the ring rows are
+decoded and the refusals refused, with no server). It has not been re-run against a v1.1.0 server.
+
 | Leg | Asserts | Server |
 |---|---|---|
 | 1 Codec | every `frame`, `exchange` (decode and request-encode checks) and `decode` vector | none |
 | 2 Trust | every `trust` vector: the identical fingerprint string from a key and from its certificate; `known_servers` parsing, and every vector of `trust-vectors/v1.json`; an unknown key is refused; a changed key is refused naming both; insecure mode is off unless asked for with a reason | one node |
-| 3 Replay | every `exchange` vector with `replay: true` and its topology, sent by the driver's **public API** where a verb exists and by its raw wire layer otherwise, compared as in 1.1 | one node, and three |
-| 4 Workload | per store type: write N documents through the public API, read them back, assert every value is equal (field by field and BSON type for type; the server does not keep a document's field order, `wire.md` section 3) and report `hits=N misses=0`. A driver that returns nothing with no error fails here | one node |
-| 5 Errors | the same bad requests produce the same code and error class, and the server's message verbatim: missing bucket, missing database, duplicate database, bucket of another type, unauthenticated request, oversized value, a mistyped document | one node |
-| 6 Limits | a document just under and just over 24 MiB; a blob at 16 MiB and just over; a write that cannot fit a replication frame; the driver refuses a frame over 32 MiB before sending, and a raw-socket test shows the server answers one by its request ID; a raw-socket test shows a bad version byte is closed without an answer; a query over the result ceiling is `RESULT_TOO_LARGE` and the **same connection** then answers `PING`; the per-address cap surfaces `OVERLOADED` with a zero request ID and the pool survives it (start the server with a small cap) | one node, tuned |
+| 3 Replay | every `ring` and `auth` exchange vector with `replay: true` and its topology, sent by the driver's **public API** where a verb exists and by its raw wire layer otherwise, compared as in 1.1 | one node |
+| 4 Workload | create a database and a bucket that declares a scalar field and one store field of each type; for N documents, insert, then write and read each store through its document (`fifoStore` and `lifoStore` push, pop, peek, claim and ack; `hashStore` and `btreeStore` put, get, take; `heapStore` and `blobStore` as far as `operations.md` section 4 says they run); read back every value (field by field and BSON type for type; the server does not keep a document's field order, `wire.md` section 3) and report `hits=N misses=0`. A driver that returns nothing with no error fails here | one node |
+| 5 Errors | the same bad requests produce the same code and error class, and the server's message verbatim: missing bucket, missing database, a database that exists, a bucket that exists with other fields, an `insert` of a held `_id_`, an unauthenticated request, a verb the store does not answer, an undeclared field | one node |
+| 6 Limits | the driver refuses a frame over 32 MiB before sending, and a raw-socket test shows the server answers one by its request ID; a raw-socket test shows a bad version byte is closed without an answer; a 256th operation of a batch is refused by the driver before sending; a result over the ceiling is `RESULT_TOO_LARGE` and the **same connection** then answers `PING`; the per-address cap surfaces `OVERLOADED` with a zero request ID and the pool survives it (start the server with a small cap) | one node, tuned |
 | 7 Lifecycle | the server killed mid-request: the driver reports a local `UNAVAILABLE`-class error, does not hang, and recovers on the next request after a restart; an idle connection the server closed is detected and replaced, not used | one node |
 | 8 Auth | **on a dedicated server**: a wrong password is `CREDENTIALS` and the next attempt dials a new connection; a token minted on one connection authenticates another; an expired or invalid token falls back to the password exactly once; `RATE_LIMITED` is not retried in a loop; a dropped user's pooled connections close and the next call reports the refusal | one node, its own |
-| 9 Cluster | an `all` write with one node stopped is answered success with `copies_confirmed` below `replication_factor`; a write concern word the server does not know is refused; a write at a node not yet added is `UNAVAILABLE`, `not_applied`; `consistent get` reads back a just-acknowledged write; a node that leaves does not break the pool | three nodes |
-| 10 Pipelining | provisional until a server advertises `query_pipelining` | — |
+| 9 Cluster | a request sent to a node that is not the owner is forwarded, or is a `NOT_OWNER` the driver follows once under the same request ID; a stale topology is a `STALE_EPOCH` the driver refreshes once; a write resent under the same request ID after a lost answer answers `deduped`; a node that leaves does not break the connection. Not gated until the cluster recipe of section 3.2 is proven | three nodes |
+| 10 Pipelining | requests in flight on one connection are matched to their replies by request ID, in any order | one node |
 
 ## 3. Getting a real server
 
-The driver repositories do not contain the server's source. They test against the **server binary**,
-published as an asset of a release of the driver repository, and named, with its SHA-256, in
-`testing/server.json`:
+The driver repositories do not contain the server's source. They test against a **server binary**, read
+from `HOARDDB_SERVER_BIN`; the `hoarddb` command-line client, where a leg needs it, is read from
+`HOARDDB_CLI_BIN`.
+
+**No test-server binary is published yet.** Build both from the server repository,
+`github.com/hoarddb/hoarddb-server`:
+
+    git clone https://github.com/hoarddb/hoarddb-server.git
+    cd hoarddb-server
+    go build -o hoarddb-server ./cmd/server
+    go build -o hoarddb ./cmd/cli       # the Go version is the one its go.mod names
+    export HOARDDB_SERVER_BIN=$PWD/hoarddb-server HOARDDB_CLI_BIN=$PWD/hoarddb
+
+`testing/server.json` and `scripts/fetch-server.sh` are for a download, once a release carries one. The
+file names a tag, the server commit and, per platform, an asset name and its SHA-256:
 
 ```json
 { "tag": "test-server-<server commit, 12 hex>",
   "server_commit": "<40 hex>",
-  "assets": { "linux-amd64": {"name": "hoardDB-server-linux-amd64", "sha256": "<64 hex>"},
-              "linux-arm64": {"name": "hoardDB-server-linux-arm64", "sha256": "<64 hex>"} },
-  "cli_assets": { "linux-amd64": {"name": "hoarddb-linux-amd64", "sha256": "<64 hex>"},
-                  "linux-arm64": {"name": "hoarddb-linux-arm64", "sha256": "<64 hex>"} } }
+  "assets": { "linux-amd64": {"name": "<asset name>", "sha256": "<64 hex>"},
+              "linux-arm64": {"name": "<asset name>", "sha256": "<64 hex>"} },
+  "cli_assets": { "linux-amd64": {"name": "<asset name>", "sha256": "<64 hex>"},
+                  "linux-arm64": {"name": "<asset name>", "sha256": "<64 hex>"} } }
 ```
 
-`cli_assets` is the `hoarddb` command-line client built from the same server commit. It is fetched with
-`scripts/fetch-server.sh --cli` and read from `HOARDDB_CLI_BIN`. Leg 8 uses it to create (and drop) a second
-user, because `USER_CREATE` carries a client-derived Argon2id credential a driver with only the standard
-library and the BSON codec cannot compute (`handbook/auth.md` sections 6 and 7).
+`scripts/fetch-server.sh` downloads the asset for the machine's platform through the GitHub API, checks
+the SHA-256 and prints the path; until a release exists it fails with HTTP 404. The binary is the hoardDB
+server, under its own licence; it is a test fixture, never vendored into the driver's source tree.
 
-The binary is from the **same server commit as the vectors** (`server_commit` in both files must
-match). `scripts/fetch-server.sh` downloads the asset for the machine's platform through the GitHub
-API, checks the SHA-256, and prints the path; tests read it from `HOARDDB_SERVER_BIN`. A CI job uses the
-workflow's token; an interactive session uses a token with read access to the repository's releases.
-The binary is the hoardDB server, under its own licence (shipped beside it as an asset); it is a test
-fixture, never vendored into the driver's source tree.
+Leg 8 uses the command-line client to create (and drop) a second user, because `create_user` carries a
+client-derived Argon2id credential a driver with only the standard library and the BSON codec cannot
+compute (`auth.md` sections 6 and 7).
 
 ### 3.1 One node
 
@@ -327,63 +340,31 @@ fixture, never vendored into the driver's source tree.
 Start the binary with only these in its environment, and wait for the log line that carries
 `"fingerprint":"SHA256:…"` (`trust.md` section 1): that is "ready", and it is the pin. Stop it with
 SIGTERM, then SIGKILL after 15 s. Operator limits a leg needs are set the same way, for example
-`HOARDDB_TCP_MAX_CONNS_PER_IP`, `HOARDDB_TCP_AUTH_MAX_FAILS`, `HOARDDB_MAX_DOCUMENT_BYTES`,
-`HOARDDB_MAX_BLOB_BYTES`, `HOARDDB_QUERY_MAX_RESULT_BYTES`, `HOARDDB_TCP_IDLE_TIMEOUT`.
+`HOARDDB_TCP_MAX_CONNS_PER_IP`, `HOARDDB_TCP_AUTH_MAX_FAILS`, `HOARDDB_QUERY_MAX_RESULT_BYTES`,
+`HOARDDB_TCP_IDLE_TIMEOUT`.
 
-The node id is not decoration: the `user list` vector's `master` is the id of the node that serves
-mutations, it is not in `vary`, and the generator's standalone server ran as `vectors-node`, so a
-replay server left on the host-name default fails that row. `HOARDDB_NODE_ID` is also what a cluster
-names a node by (section 3.2).
+`HOARDDB_NODE_ID` is what a cluster names a node by (section 3.2).
 
-A host whose data disk looks more than 85% full makes the server protect itself: it answers
-`healthy: false` (with a `capacity: disk is over its limit` reason), and the cluster `health`
-vectors fail. A test fixture on such a host, for example a cloud sandbox that reports a small disk,
+A host whose data disk looks more than 85% full makes the server protect itself: it reports
+itself unhealthy. A test fixture on such a host, for example a cloud sandbox that reports a small disk,
 sets the server's own `HOARDDB_DISK_HIGH_WATER` (a used-disk percent, 0 to 100; default `85`) in
 the server's environment, for example `HOARDDB_DISK_HIGH_WATER=95`. `0` turns the guard off.
 
 ### 3.2 Three nodes, on one machine
 
-> **Out of date.** The recipe below sets `HOARDDB_REPLICATION_FACTOR=3` and a seed list
-> without `HOARDDB_CLUSTER_ENABLED=true`, which is the replicated mode the server now refuses at
-> start. A ring cluster is started with `HOARDDB_CLUSTER_ENABLED=true`, the first node listing no
-> seeds, each later node listing the nodes already in the cluster, and one
-> `<node-id>=SHA256:<64 hex>` pin per node listed; copies are set per database with
-> `create database <name> { replication_factor: N }`. That recipe has not been re-proven for the
-> driver tests, so treat steps 3 and 5 as the replaced design until it is.
-
-Proven on loopback (three processes, one machine) with the server this handbook was derived from:
-
-1. For each node `nodeN`, make a data directory and write its identity into `<data dir>/keys/`: an
-   ed25519 key as PKCS#8 PEM (`-----BEGIN PRIVATE KEY-----`) in `server.key` (mode `0600`) and a
-   self-signed X.509 certificate for it as PEM in `server.crt`. Compute each node's fingerprint
-   (`trust.md` section 2).
-2. Choose, per node, a ring port `R` whose successor `R+1` is also free (the internode listener is
-   always on the ring port plus one), a driver port and a metrics port.
-3. Start every node with the single-node variables above, except `HOARDDB_TCP_INTERNODE_LISTEN`, plus:
-
-       HOARDDB_NODE_ID=nodeN
-       HOARDDB_LISTEN=127.0.0.1:R_N
-       HOARDDB_SEED_NODES=node1@127.0.0.1:R_1,node2@127.0.0.1:R_2,node3@127.0.0.1:R_3
-       HOARDDB_SEED_FINGERPRINTS=127.0.0.1:R_1=SHA256:<fp1>,127.0.0.1:R_2=SHA256:<fp2>,127.0.0.1:R_3=SHA256:<fp3>
-       HOARDDB_CLUSTER_TOKEN=<the same 64 hex characters on every node>
-       HOARDDB_REPLICATION_FACTOR=3
-
-   and the **same** root user and password on every node.
-4. Ready when every node's `HEALTH_CHECK` answers `membership: confirmed`. Until then a node refuses requests that name a database or
-   bucket with `UNAVAILABLE`.
-5. A write on any node is acknowledged with `copies_confirmed`; with all three up the default write
-   concern reports 2 or 3 of 3.
-
-To stop a node for a leg, SIGTERM it; to bring it back, start it again with the same data directory and
-variables.
+A ring cluster is started with `HOARDDB_CLUSTER_ENABLED=true`, the first node listing no seeds, each later
+node listing the nodes already in the cluster, and one `<node-id>=SHA256:<64 hex>` pin per node listed;
+copies are set per database with `create database <name> { replication_factor: N }`
+(the earlier replicated mode, with `HOARDDB_REPLICATION_FACTOR` and a seed list but no
+`HOARDDB_CLUSTER_ENABLED`, is refused at start). That recipe has not been re-proven for the driver
+tests, so leg 9 is not a gate until it is.
 
 ### 3.3 With containers
 
-`testing/compose/` holds the same three-node cluster as a compose file, built from a two-line image
-(`testing/compose/server.Dockerfile`: the fetched binary on a small base image) so no server source is
-needed. Its driver ports are published on `127.0.0.1:7433`, `7434` and `7435`. It needs a Docker daemon,
-which a CI runner has and a sandbox may not; the process recipe in 3.2 needs nothing but the binary, so
-it is the default.
+`testing/compose/` in the Go repository holds a three-node compose file built from a two-line image
+(`testing/compose/server.Dockerfile`: the server binary on a small base image). It starts the nodes in
+the earlier replicated mode (`HOARDDB_REPLICATION_FACTOR` and a seed list), which a v1.1.0 server refuses
+at start, so it does not come up with a v1.1.0 binary. It has not been rewritten for the ring yet.
 
 ## 4. Test layers inside a driver
 
@@ -402,9 +383,12 @@ on by hand, watching it fail, and restoring the code exactly.
 
 ## 5. Continuous integration
 
-Every pull request runs: the unit, component and fuzz-seed tests with the race detector; the linter;
-the vulnerability check; the licence and boundary checks (the driver imports no server code; every
-source file carries the Apache-2.0 header; no third-party type appears in the public API; the only
-third-party module is the BSON codec; no other database product is named outside the allow-listed
-lines); and the conformance harness against the fetched server binary, one node and three. A red job
-blocks the merge.
+What a driver's pull-request checks are meant to cover: the unit, component and fuzz-seed tests with the
+race detector; the linter; the vulnerability check; and the licence and boundary checks (the driver
+imports no server code; every source file carries the Apache-2.0 header; no third-party type appears in
+the public API; no other database product is named outside the allow-listed lines).
+
+The conformance harness needs a server binary. Until a test-server binary is published it is run by hand
+against a binary built from source (section 3). The Go repository's workflow today runs
+`go vet ./... && go test -short ./...` on every pull request, and `-short` skips every test that needs
+a server.

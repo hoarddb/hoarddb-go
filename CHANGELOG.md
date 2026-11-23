@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## v0.1.0
+
+The first tagged version, pre-release. Package `ring` speaks the ring protocol of a hoardDB v1.1
+server. The root package speaks the opcodes of the server's earlier single-store engine: a v1.1.0
+server still answers them, from a separate store on one node (see the README, "Two packages"). The
+entries below that mention a cluster, copies of a bucket or a replication factor in the root package
+describe that earlier engine's replicated mode, which a v1.1.0 server refuses to start in.
 
 ### Tests
 
@@ -12,7 +18,7 @@
 
 ### Changed
 
-- Error messages of package `ring` begin `ring: ` instead of `ringclient: `, the name of the in-tree package
+- Error messages of package `ring` begin `ring: ` instead of `ringclient: `, the name of the server-side package
   this client was copied from. Code that strips the prefix before printing a message has to strip the new one;
   `errors.Is`, the error codes and every request and reply payload are unchanged.
 - `ring.Options.KnownServers` compares `Options.Addr` in the canonical form the hoardDB command line tool
@@ -25,7 +31,7 @@
   for another. The store's own writer records the canonical form as well, and a form the tool refuses is
   skipped or misses the lookup rather than being recorded under another server.
 - The AUTH login of package `ring` names the client `hoarddb-go` instead of `ringclient`, so a server log
-  tells a request from this driver apart from one the internal ring client sent. No request or reply payload
+  tells a request from this driver apart from one the server's own ring client sent. No request or reply payload
   changes.
 - A string document id sent by package `ring` must be valid UTF-8 and take at most 1024 bytes encoded (each zero
   byte takes two). An id that is not is refused before anything is sent, with the fix in the message. The client
@@ -104,10 +110,7 @@
   predates an alter relearns it once before its one keyed frame. The refusal is returned as it came and the next
   call on that bucket describes it again. It is for benchmarks; the default is unchanged.
 - The header cache of a `ring.Client` is split over 16 locks, and its key no longer allocates on a lookup. A cached
-  bucket costs about 290 B plus 72 B per declared field of live heap (measured: 360 B for a bucket of one field,
-  936 B for one of nine), and no descriptor, goroutine or timer; storing 10^6 declarations takes about 360 ns
-  each, the second half no slower than 1.5 times the first (`TestMillionDescribesStayLinear`,
-  `TestCachedDescribesCostBytesPerBucket`).
+  bucket costs heap memory only: no descriptor, goroutine or timer (`TestCachedDescribesCostBytesPerBucket`).
 - `ring.Client.Leave`, `RemoveNode` and `ReplaceNode`: the three membership commands the package did not have.
   `Leave(ctx, id)` starts the orderly departure of a member, `RemoveNode(ctx, id)` removes a member that is down or
   dead, and `ReplaceNode(ctx, id, addr)` puts the machine at `addr` in that member's place. Each returns the
